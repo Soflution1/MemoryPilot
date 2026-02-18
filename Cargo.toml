@@ -1,0 +1,25 @@
+[package]
+name = "memory-pilot"
+version = "2.1.0"
+edition = "2021"
+authors = ["SOFLUTION LTD"]
+description = "High-performance MCP memory server — SQLite FTS5, dedup, importance, TTL, bulk ops, export."
+license = "MIT"
+repository = "https://github.com/Soflution1/memory-pilot"
+keywords = ["mcp", "memory", "sqlite", "cursor", "ai"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled", "modern_sqlite"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
