@@ -5,9 +5,13 @@ edition = "2021"
 authors = ["SOFLUTION LTD"]
 description = "High-performance MCP memory server — SQLite FTS5, dedup, importance, TTL, bulk ops, export."
 license = "MIT"
-repository = "https://github.com/Soflution1/memory-pilot"
+repository = "https://github.com/Soflution1/MemoryPilot"
 keywords = ["mcp", "memory", "sqlite", "cursor", "ai"]
 categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "MemoryPilot"
+path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

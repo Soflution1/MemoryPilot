@@ -10,7 +10,7 @@ use protocol::{JsonRpcRequest, JsonRpcResponse};
 use serde_json::json;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const SERVER_NAME: &str = "memory-pilot";
+const SERVER_NAME: &str = "MemoryPilot";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -72,10 +72,10 @@ fn print_help() {
     println!("MemoryPilot v{} — MCP memory server with SQLite FTS5", VERSION);
     println!();
     println!("USAGE:");
-    println!("  memory-pilot              Start MCP stdio server");
-    println!("  memory-pilot --migrate    Migrate v1 JSON data to SQLite");
-    println!("  memory-pilot --version    Show version");
-    println!("  memory-pilot --help       Show this help");
+    println!("  MemoryPilot              Start MCP stdio server");
+    println!("  MemoryPilot --migrate    Migrate v1 JSON data to SQLite");
+    println!("  MemoryPilot --version    Show version");
+    println!("  MemoryPilot --help       Show this help");
     println!();
     println!("MCP TOOLS (16):");
     println!("  add_memory          Store with auto-dedup, importance (1-5), TTL");
