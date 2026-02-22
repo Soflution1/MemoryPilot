@@ -90,6 +90,56 @@ pub fn extract_entities(content: &str, project: Option<&str>) -> Vec<Entity> {
     entities
 }
 
+pub fn traverse_graph(
+    conn: &rusqlite::Connection,
+    root_ids: &[String],
+    max_depth: u32,
+) -> Result<HashSet<String>, String> {
+    if root_ids.is_empty() || max_depth == 0 {
+        return Ok(HashSet::new());
+    }
+
+    let mut current_level: HashSet<String> = root_ids.iter().cloned().collect();
+    let mut all_visited: HashSet<String> = current_level.clone();
+
+    for _ in 0..max_depth {
+        let mut next_level = HashSet::new();
+        
+        for id in &current_level {
+            // Find targets where this is the source
+            if let Ok(mut stmt) = conn.prepare("SELECT target_id FROM memory_links WHERE source_id = ?1") {
+                if let Ok(rows) = stmt.query_map(rusqlite::params![id], |row| row.get::<_, String>(0)) {
+                    for r in rows.flatten() {
+                        if !all_visited.contains(&r) {
+                            next_level.insert(r.clone());
+                            all_visited.insert(r);
+                        }
+                    }
+                }
+            }
+
+            // Find sources where this is the target
+            if let Ok(mut stmt) = conn.prepare("SELECT source_id FROM memory_links WHERE target_id = ?1") {
+                if let Ok(rows) = stmt.query_map(rusqlite::params![id], |row| row.get::<_, String>(0)) {
+                    for r in rows.flatten() {
+                        if !all_visited.contains(&r) {
+                            next_level.insert(r.clone());
+                            all_visited.insert(r);
+                        }
+                    }
+                }
+            }
+        }
+        
+        if next_level.is_empty() {
+            break;
+        }
+        current_level = next_level;
+    }
+
+    Ok(all_visited)
+}
+
 /// Infer relationship type between two memories based on their kinds.
 pub fn infer_relation(source_kind: &str, target_kind: &str) -> &'static str {
     match (source_kind, target_kind) {

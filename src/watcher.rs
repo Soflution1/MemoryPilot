@@ -1,11 +1,15 @@
 use notify::{Watcher, RecursiveMode, Event, EventKind};
 use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 use chrono::Utc;
+use std::time::{Instant, Duration};
 
 pub struct FileWatcherState {
     pub recent_changes: VecDeque<FileChange>,
+    pub auto_lint: bool,
+    pub last_lint_time: Instant,
+    pub active_lint_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -19,6 +23,9 @@ impl FileWatcherState {
     pub fn new() -> Self {
         Self {
             recent_changes: VecDeque::with_capacity(20),
+            auto_lint: false,
+            last_lint_time: Instant::now(),
+            active_lint_error: None,
         }
     }
 
@@ -58,7 +65,9 @@ impl FileWatcherState {
 pub fn start_watcher(dir: &str) -> Option<Arc<Mutex<FileWatcherState>>> {
     let state = Arc::new(Mutex::new(FileWatcherState::new()));
     let state_clone = state.clone();
+    let state_linter = state.clone();
     let dir_path = PathBuf::from(dir);
+    let dir_str = dir.to_string();
 
     std::thread::spawn(move || {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -94,9 +103,108 @@ pub fn start_watcher(dir: &str) -> Option<Arc<Mutex<FileWatcherState>>> {
                 if let Ok(mut s) = state_clone.lock() {
                     s.push(FileChange {
                         path: path_str.to_string(),
-                        filename,
+                        filename: filename.clone(),
                         timestamp: Utc::now().to_rfc3339(),
                     });
+                }
+            }
+        }
+    });
+
+    // Background linter thread
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(5)); // Debounce interval
+
+            let should_lint = if let Ok(mut s) = state_linter.lock() {
+                if !s.auto_lint { false }
+                else if s.last_lint_time.elapsed() > Duration::from_secs(4) {
+                    s.last_lint_time = Instant::now();
+                    true
+                } else {
+                    false
+                }
+            } else { false };
+
+            if should_lint {
+                // Determine which linter to run based on project files
+                let dir_p = Path::new(&dir_str);
+                let mut cmd = None;
+                if dir_p.join("Cargo.toml").exists() {
+                    cmd = Some(("cargo", vec!["check"]));
+                } else if dir_p.join("package.json").exists() {
+                    if dir_p.join("svelte.config.js").exists() {
+                        cmd = Some(("npx", vec!["svelte-check"]));
+                    } else if dir_p.join("tsconfig.json").exists() {
+                        cmd = Some(("npx", vec!["tsc", "--noEmit"]));
+                    }
+                }
+
+                if let Some((program, args)) = cmd {
+                    if let Ok(output) = std::process::Command::new(program)
+                        .args(&args)
+                        .current_dir(&dir_str)
+                        .output() 
+                    {
+                        let is_error = !output.status.success();
+                        let mut error_msg = String::from_utf8_lossy(&output.stderr).to_string();
+                        if error_msg.trim().is_empty() {
+                            error_msg = String::from_utf8_lossy(&output.stdout).to_string();
+                        }
+                        
+                        let tags = vec!["auto-linter".to_string(), "bug".to_string()];
+                        
+                        if is_error {
+                            let content = format!("Auto-Linter Error:\nCommand: {} {:?}\nError:\n{}", program, args, error_msg);
+                            
+                            // Check if an active lint error is already stored to avoid spamming
+                            let should_save = if let Ok(mut s) = state_linter.lock() {
+                                if s.active_lint_error.as_deref() != Some(&content) {
+                                    s.active_lint_error = Some(content.clone());
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else { false };
+
+                            if should_save {
+                                // Since rusqlite Connection isn't Send + Sync, we open a new local connection for the background thread
+                                if let Ok(local_db) = crate::db::Database::open() {
+                                    let _ = local_db.add_memory(
+                                        &content,
+                                        "bug",
+                                        None,
+                                        &tags,
+                                        "auto-linter",
+                                        5,
+                                        None,
+                                        None,
+                                    );
+                                }
+                            }
+                        } else {
+                            // If successful, clear the active error
+                            let cleared = if let Ok(mut s) = state_linter.lock() {
+                                if s.active_lint_error.is_some() {
+                                    s.active_lint_error = None;
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else { false };
+
+                            if cleared {
+                                // Search for open auto-linter bugs and delete them
+                                if let Ok(local_db) = crate::db::Database::open() {
+                                    if let Ok(results) = local_db.search("Auto-Linter Error", 10, None, Some("bug"), Some(&tags), None) {
+                                        for res in results {
+                                            let _ = local_db.delete_memory(&res.memory.id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -5,7 +5,7 @@ use crate::protocol::{tool_result, tool_error};
 
 const VALID_KINDS: &[&str] = &[
     "fact", "preference", "decision", "pattern", "snippet",
-    "bug", "credential", "todo", "note",
+    "bug", "credential", "todo", "note", "transcript",
 ];
 
 pub fn tool_definitions() -> Value {
@@ -60,6 +60,20 @@ pub fn tool_definitions() -> Value {
                     }}
                 },
                 "required": ["memories"]
+            }
+        },
+        {
+            "name": "add_transcript",
+            "description": "Store a long conversation transcript by automatically chunking it. Perfect for Chunked RAG without polluting the context window.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string", "description": "The full transcript text to chunk and store" },
+                    "project": { "type": ["string","null"], "description": "Project name or null for global" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "default": [] },
+                    "source": { "type": "string", "default": "cursor" }
+                },
+                "required": ["content"]
             }
         },
         {
@@ -190,6 +204,17 @@ pub fn tool_definitions() -> Value {
             } 
         },
         {
+            "name": "toggle_auto_lint",
+            "description": "Enable or disable background auto-linting/self-healing for the current project.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "enabled": { "type": "boolean" }
+                },
+                "required": ["enabled"]
+            }
+        },
+        {
             "name": "get_file_context",
             "description": "Get memories related to recently modified files in the working directory. Uses the file watcher to know what you're working on.",
             "inputSchema": {
@@ -208,6 +233,7 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "recall" => handle_recall(db, args),
         "add_memory" => handle_add(db, args),
         "add_memories" => handle_add_bulk(db, args),
+        "add_transcript" => handle_add_transcript(db, args),
         "search_memory" => handle_search(db, args),
         "get_memory" => handle_get(db, args),
         "update_memory" => handle_update(db, args),
@@ -224,6 +250,7 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "migrate_v1" => handle_migrate(db),
         "cleanup_expired" => handle_cleanup(db),
         "run_gc" => handle_run_gc(db, args),
+        "toggle_auto_lint" => handle_toggle_lint(args),
         "get_file_context" => handle_get_file_context(db, args),
         _ => tool_error(&format!("Unknown tool: {}", name)),
     }
@@ -272,6 +299,66 @@ fn handle_add_bulk(db: &Database, args: &Value) -> Value {
         Ok((added, merged, skipped)) => {
             tool_result(&format!("Bulk complete: {} added, {} merged (dedup), {} skipped. Total processed: {}.",
                 added.len(), merged, skipped, items.len()))
+        }
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_add_transcript(db: &Database, args: &Value) -> Value {
+    let content = match args.get("content").and_then(|v| v.as_str()) {
+        Some(c) if !c.trim().is_empty() => c,
+        _ => return tool_error("content is required"),
+    };
+    let project = args.get("project").and_then(|v| v.as_str()).map(String::from);
+    let tags: Vec<String> = args.get("tags").and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+    let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("cursor").to_string();
+
+    let transcript_id = uuid::Uuid::new_v4().to_string();
+    let chunk_size = 2000;
+    
+    // Simple word-boundary chunking
+    let mut chunks = Vec::new();
+    let mut current_chunk = String::new();
+    
+    for word in content.split_whitespace() {
+        if current_chunk.len() + word.len() > chunk_size && !current_chunk.is_empty() {
+            chunks.push(current_chunk.clone());
+            current_chunk.clear();
+        }
+        if !current_chunk.is_empty() {
+            current_chunk.push(' ');
+        }
+        current_chunk.push_str(word);
+    }
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
+    }
+
+    let mut bulk_items = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let metadata = json!({
+            "transcript_id": transcript_id,
+            "chunk_index": i,
+            "total_chunks": chunks.len()
+        });
+        
+        bulk_items.push(BulkItem {
+            content: chunk.clone(),
+            kind: "transcript".to_string(),
+            project: project.clone(),
+            tags: Some(tags.clone()),
+            source: source.clone(),
+            importance: Some(3),
+            expires_at: None,
+            metadata: Some(metadata),
+        });
+    }
+
+    match db.add_memories_bulk(&bulk_items) {
+        Ok((added, merged, skipped)) => {
+            tool_result(&format!("Transcript processed into {} chunks. {} added, {} merged (dedup), {} skipped. Transcript ID: {}",
+                chunks.len(), added.len(), merged, skipped, transcript_id))
         }
         Err(e) => tool_error(&e),
     }
@@ -348,7 +435,7 @@ fn handle_list(db: &Database, args: &Value) -> Value {
     let kind = args.get("kind").and_then(|v| v.as_str());
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
     let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    match db.list_memories(project, kind, limit, offset) {
+    match db.list_memories(project, kind, None, limit, offset) {
         Ok((memories, total)) => {
             tool_result(&serde_json::to_string_pretty(&json!({"total":total,"count":memories.len(),"offset":offset,"memories":memories})).unwrap())
         }
@@ -454,6 +541,29 @@ fn handle_run_gc(db: &Database, args: &Value) -> Value {
     match db.run_gc(&config, dry_run) {
         Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
         Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_toggle_lint(args: &Value) -> Value {
+    let enabled = match args.get("enabled").and_then(|v| v.as_bool()) {
+        Some(b) => b,
+        None => return tool_error("enabled boolean is required"),
+    };
+    
+    if let Some(watcher) = crate::WATCHER_STATE.get() {
+        if let Ok(mut state) = watcher.lock() {
+            state.auto_lint = enabled;
+            if enabled {
+                tool_result("Auto-linting (Self-Healing) has been ENABLED for this project.")
+            } else {
+                state.active_lint_error = None;
+                tool_result("Auto-linting has been DISABLED.")
+            }
+        } else {
+            tool_error("Could not acquire watcher lock")
+        }
+    } else {
+        tool_error("Watcher is not running")
     }
 }
 

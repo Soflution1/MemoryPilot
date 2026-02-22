@@ -4,11 +4,11 @@
 
 <p align="center">
   <strong>The most advanced MCP memory server. Period.</strong><br>
-  <sub>Hybrid search (BM25 + TF-IDF RRF) · Knowledge graph · GC · Project brain · File watcher · Single binary</sub>
+  <sub>Hybrid search (BM25 + TF-IDF RRF) · GraphRAG · Chunked RAG · Auto-Linting (Self-Healing) · Project brain · Single binary</sub>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/v3.1-latest-green" alt="v3.1"/>
+  <img src="https://img.shields.io/badge/v3.2-latest-green" alt="v3.2"/>
   <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust"/>
   <img src="https://img.shields.io/badge/search-Hybrid_RRF-blueviolet" alt="Hybrid RRF"/>
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT"/>
@@ -23,20 +23,22 @@ AI coding assistants forget everything between sessions. MemoryPilot gives them 
 
 **vs every other MCP memory server:**
 
-| Feature | MemoryPilot v3.1 | MCP Memory (Node.js) | Other Rust/Python servers |
+| Feature | MemoryPilot v3.2 | MCP Memory (Node.js) | Other Rust/Python servers |
 |---------|-----------------|----------------------|--------------------------|
 | Search | Hybrid BM25 + TF-IDF RRF fusion | Unranked filter | BM25 only |
-| Knowledge graph | Auto entity extraction + linking | No | No |
+| GraphRAG | Auto entity extraction + graph traversal | No | No |
+| Chunked RAG | Transcript auto-chunking (Zero context bloat) | No | No |
+| Self-Healing | Background auto-linting loop | No | No |
 | Garbage collection | Heuristic merge + scoring | No | TTL only |
 | Project brain (<1500 tokens) | Yes | No | No |
 | File watcher context boost | Yes | No | No |
 | Deduplication | Jaccard 85% threshold | No | Basic exact match |
-| Memory types | 9 types, importance 1-5 | 1 type | 2-3 types |
+| Memory types | 10 types, importance 1-5 | 1 type | 2-3 types |
 | Startup | 1-2 ms | 50-100 ms | 5-20 ms |
 | Binary | 2.4 MB, zero deps | 200 MB+ (node_modules) | 5-50 MB |
 | Storage | SQLite WAL + FTS5 | JSON files | SQLite basic |
 
-## The 5 Pillars
+## The 6 Pillars
 
 ### 1. Hybrid Search (BM25 + TF-IDF RRF)
 
@@ -44,23 +46,27 @@ Every memory gets a 384-dimension TF-IDF embedding vector on insert. Search runs
 
 Results are boosted by importance weighting, knowledge graph link density, and file watcher context.
 
-### 2. Knowledge Graph
+### 2. GraphRAG
 
 Every memory is automatically analyzed for entities: technologies, file paths, components, projects. Entities are stored in a dedicated table. Memories sharing entities are auto-linked with inferred relationship types (resolves, implements, depends_on, deprecates...).
 
-The graph gives search a PageRank-like boost: well-connected memories rank higher.
+When searching, `MemoryPilot` traverses the knowledge graph (GraphRAG) from the top matches to pull in related context (e.g., finding the architecture decision that led to a specific bug fix).
 
-### 3. Garbage Collection
+### 3. Chunked RAG (Transcripts)
+
+You can save full conversation transcripts without polluting the LLM context window. The `add_transcript` tool automatically chunks large texts into ~2000 character blocks and links them together. These chunks are excluded from auto-loading on startup (`recall`), but are perfectly searchable via Vector embeddings.
+
+### 4. Self-Healing (Auto-Linter)
+
+MemoryPilot watches your files. When you save a Rust (`cargo check`), Svelte (`svelte-check`), or TS (`tsc`) file, it lints it in the background. If it finds a compilation error, it automatically creates a `bug` memory with the exact stack trace. Your AI agent instantly knows what's broken without you having to copy-paste the terminal output.
+
+### 5. Garbage Collection
 
 Old, low-importance memories are scored for cleanup candidacy. Groups of related stale memories are merged into condensed summaries using heuristic keyword extraction. Orphaned links and entities are cleaned. DB is vacuumed after significant deletions.
 
-### 4. Project Brain
+### 6. Project Brain
 
 One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech stack, architecture decisions, active bugs, recent changes, key components. Perfect for injecting into a new conversation.
-
-### 5. File Watcher
-
-Monitors the working directory for file changes. Recently modified file names are used as boost keywords during search, so memories related to what you're actively editing rank higher automatically.
 
 ## Install
 

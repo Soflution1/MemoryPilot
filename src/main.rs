@@ -30,19 +30,21 @@ fn main() {
     run_mcp_server();
 }
 
-fn run_mcp_server() {
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(state) = watcher::start_watcher(&cwd.to_string_lossy()) {
-            let _ = WATCHER_STATE.set(state);
+    fn run_mcp_server() {
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Some(state) = watcher::start_watcher(&cwd.to_string_lossy()) {
+                let _ = WATCHER_STATE.set(state);
+            }
         }
-    }
-    
-    let db = match db::Database::open() {
-        Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); }
-    };
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut out = stdout.lock();    for line in stdin.lock().lines() {
+        
+        let db = match db::Database::open() {
+            Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); }
+        };
+        let db_arc = std::sync::Arc::new(db);
+        
+        let stdin = io::stdin();
+        let stdout = io::stdout();
+        let mut out = stdout.lock();    for line in stdin.lock().lines() {
         let line = match line { Ok(l) if !l.trim().is_empty() => l, Ok(_) => continue, Err(_) => break };
         let request: JsonRpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
@@ -52,7 +54,7 @@ fn run_mcp_server() {
                 let _ = out.flush(); continue;
             }
         };
-        let response = handle_request(&db, &request);
+        let response = handle_request(&db_arc, &request);
         let _ = writeln!(out, "{}", serde_json::to_string(&response).unwrap());
         let _ = out.flush();
     }

@@ -392,7 +392,7 @@ impl Database {
             let imp = item.importance.unwrap_or(3);
             let exp = item.expires_at.as_deref();
             match self.add_memory(&item.content, &item.kind, item.project.as_deref(),
-                                  &tags, &item.source, imp, exp, None) {
+                                  &tags, &item.source, imp, exp, item.metadata.as_ref()) {
                 Ok((mem, was_merged)) => {
                     if was_merged { merged += 1; } else { added.push(mem); }
                 }
@@ -565,6 +565,28 @@ impl Database {
             }
         }
         
+        // 4. GraphRAG Traversal (Expand context based on top matches)
+        let top_ids: Vec<String> = results.iter().take(3).map(|r| r.memory.id.clone()).collect();
+        if let Ok(related_ids) = crate::graph::traverse_graph(&self.conn, &top_ids, 1) {
+            for rel_id in related_ids {
+                // If it's not already in results, fetch it and add it
+                if !results.iter().any(|r| r.memory.id == rel_id) {
+                    if let Ok(Some(mem)) = self.get_memory(&rel_id) {
+                        results.push(SearchResult { 
+                            memory: mem, 
+                            // Give it a slightly lower score than the original match that pulled it
+                            score: 0.1 
+                        });
+                    }
+                }
+            }
+        }
+
+        // Re-sort because graph traversal may have added items at the end
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        // We can truncate to limit if we don't want the graph traversal to exceed the limit
+        // results.truncate(limit); // Commented out so GraphRAG can actually expand the context
+        
         // Update access count and timestamp for returned results
         for res in &results {
             let _ = self.conn.execute("UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1 WHERE id = ?2", 
@@ -575,7 +597,7 @@ impl Database {
     }
     // ─── LIST ─────────────────────────────────────────
 
-    pub fn list_memories(&self, project: Option<&str>, kind: Option<&str>,
+    pub fn list_memories(&self, project: Option<&str>, kind: Option<&str>, exclude_kind: Option<&str>,
                          limit: usize, offset: usize) -> Result<(Vec<Memory>, i64), String> {
         let _ = self.cleanup_expired();
 
@@ -589,6 +611,10 @@ impl Database {
         if let Some(k) = kind {
             conditions.push(format!("kind = ?{}", param_values.len() + 1));
             param_values.push(Box::new(k.to_string()));
+        }
+        if let Some(ek) = exclude_kind {
+            conditions.push(format!("kind != ?{}", param_values.len() + 1));
+            param_values.push(Box::new(ek.to_string()));
         }
 
         let where_clause = if conditions.is_empty() { String::new() }
@@ -716,7 +742,7 @@ impl Database {
     // ─── EXPORT ───────────────────────────────────────
 
     pub fn export_memories(&self, project: Option<&str>, format: &str) -> Result<String, String> {
-        let (memories, _) = self.list_memories(project, None, 10000, 0)?;
+        let (memories, _) = self.list_memories(project, None, None, 10000, 0)?;
         match format {
             "json" => serde_json::to_string_pretty(&memories).map_err(|e| format!("JSON: {}", e)),
             "markdown" | "md" => {
@@ -934,23 +960,23 @@ impl Database {
             }
         }
         
-        let (core_arch, _) = self.list_memories(Some(project), Some("architecture"), 10, 0)?;
+        let (core_arch, _) = self.list_memories(Some(project), Some("architecture"), None, 10, 0)?;
         let mut arch_content = Vec::new();
         for m in core_arch {
             if current_chars + m.content.len() > max_chars { break; }
             current_chars += m.content.len();
             arch_content.push(m.content);
         }
-
-        let (decisions, _) = self.list_memories(Some(project), Some("decision"), 10, 0)?;
+        
+        let (decisions, _) = self.list_memories(Some(project), Some("decision"), None, 10, 0)?;
         let mut dec_content = Vec::new();
         for m in decisions {
             if current_chars + m.content.len() > max_chars { break; }
             current_chars += m.content.len();
             dec_content.push(m.content);
         }
-
-        let (bugs, _) = self.list_memories(Some(project), Some("bug"), 10, 0)?;
+        
+        let (bugs, _) = self.list_memories(Some(project), Some("bug"), None, 10, 0)?;
         let mut bug_content = Vec::new();
         for m in bugs {
             if current_chars + m.content.len() > max_chars { break; }
@@ -1000,11 +1026,11 @@ impl Database {
         };
         let proj_ref = proj_name.as_deref();
         let (proj_memories, proj_total) = if let Some(p) = proj_ref {
-            self.list_memories(Some(p), None, 100, 0)?
+            self.list_memories(Some(p), None, Some("transcript"), 100, 0)?
         } else { (vec![], 0) };
-        let (prefs, _) = self.list_memories(None, Some("preference"), 50, 0)?;
-        let (patterns, _) = self.list_memories(None, Some("pattern"), 50, 0)?;
-        let (snippets, _) = self.list_memories(None, Some("snippet"), 20, 0)?;
+        let (prefs, _) = self.list_memories(None, Some("preference"), None, 50, 0)?;
+        let (patterns, _) = self.list_memories(None, Some("pattern"), None, 50, 0)?;
+        let (snippets, _) = self.list_memories(None, Some("snippet"), None, 20, 0)?;
 
         Ok(serde_json::json!({
             "project": proj_ref.unwrap_or("none"),
@@ -1033,13 +1059,13 @@ impl Database {
 
         // 1. Project memories (if project detected)
         let (proj_memories, proj_total) = if let Some(p) = proj_ref {
-            self.list_memories(Some(p), None, 50, 0)?
+            self.list_memories(Some(p), None, Some("transcript"), 50, 0)?
         } else { (vec![], 0) };
 
         // 2. Global preferences + patterns (always useful)
-        let (prefs, _) = self.list_memories(None, Some("preference"), 30, 0)?;
-        let (patterns, _) = self.list_memories(None, Some("pattern"), 20, 0)?;
-        let (decisions, _) = self.list_memories(None, Some("decision"), 20, 0)?;
+        let (prefs, _) = self.list_memories(None, Some("preference"), None, 30, 0)?;
+        let (patterns, _) = self.list_memories(None, Some("pattern"), None, 20, 0)?;
+        let (decisions, _) = self.list_memories(None, Some("decision"), None, 20, 0)?;
 
         // 3. Critical memories (importance >= 4, any project)
         let critical: Vec<Memory> = {
@@ -1171,6 +1197,7 @@ pub struct BulkItem {
     pub source: String,
     pub importance: Option<i32>,
     pub expires_at: Option<String>,
+    pub metadata: Option<serde_json::Value>,
 }
 fn default_kind() -> String { "fact".into() }
 fn default_source() -> String { "cursor".into() }
