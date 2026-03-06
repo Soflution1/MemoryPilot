@@ -56,6 +56,10 @@ When searching, `MemoryPilot` traverses the knowledge graph (GraphRAG) from the 
 
 You can save full conversation transcripts without polluting the LLM context window. The `add_transcript` tool automatically chunks large texts into ~2000 character blocks and links them together. These chunks are excluded from auto-loading on startup (`recall`), but are perfectly searchable via Vector embeddings.
 
+`add_memory`, `add_memories`, `add_transcript`, `recall`, and `get_project_context` also accept optional `session_id`, `thread_id`, and `window_id` fields. This gives you lightweight multi-window and multi-conversation memory without bloating the default prompt budget: `recall` quietly boosts memories from the same thread/window before falling back to broader project context.
+
+By default, `add_transcript` also distills a few high-value structured memories out of the conversation: `decision`, `preference`, `todo`, `bug`, and `fact`. The raw transcript stays archived, while `recall` surfaces the distilled memories instead of replaying transcript chunks into the prompt. Pass `distill: false` if you only want archive-only storage.
+
 ### 4. Self-Healing (Auto-Linter)
 
 MemoryPilot watches your files. When you save a Rust (`cargo check`), Svelte (`svelte-check`), or TS (`tsc`) file, it lints it in the background. If it finds a compilation error, it automatically creates a `bug` memory with the exact stack trace. Your AI agent instantly knows what's broken without you having to copy-paste the terminal output.
@@ -107,16 +111,17 @@ MemoryPilot --migrate
 MemoryPilot --backfill
 ```
 
-## MCP Tools (20)
+## MCP Tools
 
 | Tool | Description |
 |------|-------------|
-| **`recall`** | Start here. Loads all context in one shot: project memories, preferences, critical facts, patterns, decisions, global prompt. |
+| **`recall`** | Start here. Loads all context in one shot: project memories, scoped thread/window memories, preferences, critical facts, patterns, decisions, global prompt. Supports `mode = safe/default/full` and optional `session_id/thread_id/window_id`. |
 | **`get_project_brain`** | Instant project summary (<1500 tokens): tech stack, architecture, bugs, recent changes, components. |
 | **`search_memory`** | Hybrid BM25 + TF-IDF RRF search, boosted by importance, graph links, and file watcher context. |
 | **`get_file_context`** | Memories related to recently modified files in working directory. |
 | `add_memory` | Store with auto-dedup (Jaccard 85%), auto entity extraction, auto graph linking. Importance 1-5, TTL. |
 | `add_memories` | Bulk add multiple memories in one call with per-item dedup. |
+| `add_transcript` | Store a long transcript as chunked archive memory, then distill a few high-value structured memories by default. Supports `distill: false` for archive-only mode. |
 | `get_memory` | Retrieve by ID. |
 | `update_memory` | Update content, kind, tags, importance, TTL. |
 | `delete_memory` | Delete by ID (cascades to entities and links). |
@@ -124,7 +129,8 @@ MemoryPilot --backfill
 | `get_project_context` | Full project context with preferences and patterns. |
 | `register_project` | Register project with filesystem path for auto-detection. |
 | `list_projects` | List projects with memory counts. |
-| `get_stats` | DB statistics: totals, by kind, by project, DB size. |
+| `get_stats` | DB statistics: totals, by kind, by project, DB size, and hygiene signals. |
+| `benchmark_recall` | Run a local recall benchmark and measure top-1/top-5 hit rate, cross-project leakage, credential leakage in safe mode, and explain consistency. |
 | `get_global_prompt` | Auto-discover GLOBAL_PROMPT.md from ~/.MemoryPilot/ or project root. |
 | `export_memories` | Export as JSON or Markdown with importance stars. |
 | `set_config` | Set config values (e.g. global_prompt_path). |
@@ -143,6 +149,7 @@ Each memory has importance (1-5), optional TTL, tags, project scope, and auto-ge
 ```bash
 MemoryPilot              # Start MCP stdio server
 MemoryPilot --backfill   # Compute missing TF-IDF embeddings
+MemoryPilot --benchmark-recall --scenario-limit 12
 MemoryPilot --migrate    # Import v1 JSON data to SQLite
 MemoryPilot --version    # Show version
 MemoryPilot --help       # Show help
@@ -153,7 +160,7 @@ MemoryPilot --help       # Show help
 ```
 src/main.rs        — CLI + MCP stdio server loop + file watcher init
 src/db.rs          — SQLite engine: hybrid search, CRUD, graph, GC, brain, recall
-src/tools.rs       — 20 MCP tool definitions + handlers
+src/tools.rs       — MCP tool definitions + handlers
 src/protocol.rs    — JSON-RPC types
 src/embedding.rs   — TF-IDF 384-dim vectors, cosine similarity, RRF fusion
 src/graph.rs       — Entity extraction (tech, files, components) + relation inference
@@ -184,6 +191,27 @@ config          — key/value store
 | Embedding generation | <0.1 ms per memory |
 | Storage overhead | ~1.5 KB per embedding (384 × 4 bytes) |
 | Runtime dependencies | **None** |
+
+## Recall Benchmark
+
+```bash
+MemoryPilot --benchmark-recall --scenario-limit 12
+```
+
+The benchmark runs against your real memory base and uses `recall(explain=true)` internally, so it measures the actual startup context quality instead of a synthetic side metric.
+
+It now works in two layers:
+
+- fixed `golden` scenarios for stable, repeatable quality checks
+- generated fallback scenarios from the current memory base when some golden scenarios are missing
+
+The report tells you how many golden scenarios were defined, executed, skipped, and how many generated scenarios were used to fill the rest.
+
+- `top1_hit_rate`: expected memory appears first
+- `top5_hit_rate`: expected memory appears somewhere in the first 5 selected memories
+- `cross_project_leak_rate`: selected memories from the wrong project
+- `credential_leak_rate_safe`: credential memories leaking while `mode = safe`
+- `explain_consistency_rate`: selected memories exposing search score detail for debugging
 
 ## Storage
 

@@ -11,6 +11,35 @@ pub struct GcReport {
     pub orphan_links_removed: usize,
     pub db_size_before: u64,
     pub db_size_after: u64,
+    pub preview_mode: bool,
+    pub preview_candidates: Vec<GcPreviewCandidate>,
+    pub hygiene: HygieneReport,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GcPreviewCandidate {
+    pub kind: String,
+    pub project: Option<String>,
+    pub memory_ids: Vec<String>,
+    pub sample_contents: Vec<String>,
+    pub confidence_score: f64,
+    pub gc_score_avg: f64,
+    pub age_days_min: i64,
+    pub age_days_max: i64,
+    pub importance_min: i32,
+    pub importance_max: i32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct HygieneReport {
+    pub projects_missing_path: usize,
+    pub memory_project_mismatches: usize,
+    pub never_accessed_memories: usize,
+    pub stale_low_value_memories: usize,
+    pub orphan_entities: usize,
+    pub orphan_links: usize,
+    pub credential_memories: usize,
+    pub global_memories: usize,
 }
 
 /// Configuration for GC behavior.

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 /// MemoryPilot v3.1 — God-Tier MCP memory server.
 /// Hybrid search (BM25+TF-IDF RRF), Knowledge Graph, GC, Project Brain, File Watcher.
 /// (c) SOFLUTION LTD — MIT License
@@ -27,6 +29,7 @@ fn main() {
     if args.iter().any(|a| a == "--help" || a == "-h") { print_help(); return; }
     if args.iter().any(|a| a == "--migrate") { run_migrate(); return; }
     if args.iter().any(|a| a == "--backfill") { run_backfill(); return; }
+    if args.iter().any(|a| a == "--benchmark-recall") { run_benchmark_recall(&args); return; }
     run_mcp_server();
 }
 
@@ -95,6 +98,19 @@ fn run_backfill() {
     }
 }
 
+fn run_benchmark_recall(args: &[String]) {
+    let db = match db::Database::open() { Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); } };
+    let scenario_limit = args
+        .windows(2)
+        .find(|window| window[0] == "--scenario-limit")
+        .and_then(|window| window[1].parse::<usize>().ok())
+        .unwrap_or(12);
+    match db.benchmark_recall(scenario_limit) {
+        Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())),
+        Err(error) => { eprintln!("✗ Benchmark failed: {}", error); std::process::exit(1); }
+    }
+}
+
 fn print_help() {
     println!("MemoryPilot v{} — MCP memory server with SQLite FTS5", VERSION);
     println!();
@@ -102,16 +118,18 @@ fn print_help() {
     println!("  MemoryPilot              Start MCP stdio server");
     println!("  MemoryPilot --migrate    Migrate v1 JSON data to SQLite");
     println!("  MemoryPilot --backfill   Compute missing TF-IDF embeddings");
+    println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --version    Show version");
     println!("  MemoryPilot --help       Show this help");
     println!();
-    println!("MCP TOOLS (20):");
+    println!("MCP TOOLS (23):");
     println!("  recall              Load all context in one shot (start here)");
     println!("  get_project_brain   Instant project summary (<1500 tokens)");
     println!("  search_memory       Hybrid BM25 + TF-IDF RRF search");
     println!("  get_file_context    Memories related to recently modified files");
     println!("  add_memory          Store with auto-dedup, entities, graph links");
     println!("  add_memories        Bulk add multiple memories in 1 call");
+    println!("  add_transcript      Chunk and store long transcripts");
     println!("  get_memory          Retrieve by ID");
     println!("  update_memory       Update content/kind/tags/importance/TTL");
     println!("  delete_memory       Delete by ID (cascades links/entities)");
@@ -120,12 +138,15 @@ fn print_help() {
     println!("  register_project    Register project path for auto-detection");
     println!("  list_projects       List projects with counts");
     println!("  get_stats           Database statistics");
+    println!("  benchmark_recall    Measure recall quality with golden scenarios");
     println!("  get_global_prompt   Auto-discover GLOBAL_PROMPT.md");
     println!("  export_memories     Export as JSON or Markdown");
     println!("  set_config          Set config values");
     println!("  run_gc              Garbage collection: merge, clean, vacuum");
     println!("  cleanup_expired     Remove expired memories");
     println!("  migrate_v1          Import from v1 JSON files");
+    println!("  toggle_auto_lint    Enable or disable self-healing lint memory");
+    println!("  get_file_context    Load memories for recent file changes");
     println!();
     println!("STORAGE:  ~/.MemoryPilot/memory.db");
     println!("SEARCH:   Hybrid BM25 + TF-IDF RRF + graph boost + watcher context");

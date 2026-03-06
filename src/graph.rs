@@ -9,6 +9,10 @@ pub struct Entity {
     pub value: String,
 }
 
+pub fn is_reliable_link_entity(entity: &Entity) -> bool {
+    matches!(entity.kind, "file" | "component")
+}
+
 /// Known tech patterns for auto-detection.
 const TECH_PATTERNS: &[&str] = &[
     "svelte", "sveltekit", "svelte 5", "react", "vue", "next", "nuxt", "astro",
