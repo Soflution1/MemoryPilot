@@ -1,6 +1,6 @@
 /// MCP Tool definitions and handlers for MemoryPilot v2.1.
 use serde_json::{json, Value};
-use crate::db::{Database, BulkItem};
+use crate::db::{Database, BulkItem, MemoryScope, RecallMode};
 use crate::protocol::{tool_result, tool_error};
 
 const VALID_KINDS: &[&str] = &[
@@ -18,7 +18,12 @@ pub fn tool_definitions() -> Value {
                 "properties": {
                     "project": { "type": ["string","null"], "description": "Project name (or null for auto-detect)" },
                     "working_dir": { "type": ["string","null"], "description": "Current working directory for project auto-detection" },
-                    "hints": { "type": ["string","null"], "description": "Keywords about current task for targeted memory search" }
+                    "hints": { "type": ["string","null"], "description": "Keywords about current task for targeted memory search" },
+                    "mode": { "type": ["string","null"], "enum": ["safe", "default", "full"], "description": "Recall mode. `safe` is the default and excludes credentials unless `full` is explicitly requested." },
+                    "explain": { "type": ["boolean","null"], "description": "When true, include why each memory was selected: source, search score, recency, access boost, graph boost, and project match." },
+                    "session_id": { "type": ["string","null"], "description": "Optional session scope for prioritizing same-session memories." },
+                    "thread_id": { "type": ["string","null"], "description": "Optional thread scope for prioritizing the same conversation." },
+                    "window_id": { "type": ["string","null"], "description": "Optional window scope for prioritizing memories from the same Cursor window." }
                 }
             }
         },
@@ -35,7 +40,10 @@ pub fn tool_definitions() -> Value {
                     "source": { "type": "string", "default": "cursor" },
                     "importance": { "type": "integer", "minimum": 1, "maximum": 5, "default": 3, "description": "1=trivial, 3=normal, 5=critical" },
                     "expires_at": { "type": ["string","null"], "description": "ISO date after which memory auto-deletes (e.g. 2025-06-01T00:00:00Z)" },
-                    "metadata": { "type": ["object","null"] }
+                    "metadata": { "type": ["object","null"] },
+                    "session_id": { "type": ["string","null"] },
+                    "thread_id": { "type": ["string","null"] },
+                    "window_id": { "type": ["string","null"] }
                 },
                 "required": ["content"]
             }
@@ -54,7 +62,11 @@ pub fn tool_definitions() -> Value {
                             "tags": { "type": ["array","null"], "items": { "type": "string" } },
                             "source": { "type": "string", "default": "cursor" },
                             "importance": { "type": ["integer","null"] },
-                            "expires_at": { "type": ["string","null"] }
+                            "expires_at": { "type": ["string","null"] },
+                            "metadata": { "type": ["object","null"] },
+                            "session_id": { "type": ["string","null"] },
+                            "thread_id": { "type": ["string","null"] },
+                            "window_id": { "type": ["string","null"] }
                         },
                         "required": ["content"]
                     }}
@@ -64,14 +76,18 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "add_transcript",
-            "description": "Store a long conversation transcript by automatically chunking it. Perfect for Chunked RAG without polluting the context window.",
+            "description": "Store a long conversation transcript by automatically chunking it, then distill a few high-value memories (decisions, preferences, todos, bugs, facts) without polluting the context window.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "content": { "type": "string", "description": "The full transcript text to chunk and store" },
                     "project": { "type": ["string","null"], "description": "Project name or null for global" },
                     "tags": { "type": "array", "items": { "type": "string" }, "default": [] },
-                    "source": { "type": "string", "default": "cursor" }
+                    "source": { "type": "string", "default": "cursor" },
+                    "distill": { "type": ["boolean","null"], "description": "When true (default), extract a few high-value structured memories from the transcript." },
+                    "session_id": { "type": ["string","null"] },
+                    "thread_id": { "type": ["string","null"] },
+                    "window_id": { "type": ["string","null"] }
                 },
                 "required": ["content"]
             }
@@ -135,7 +151,11 @@ pub fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "project": { "type": ["string","null"] },
-                    "working_dir": { "type": ["string","null"], "description": "Current directory for auto-detection" }
+                    "working_dir": { "type": ["string","null"], "description": "Current directory for auto-detection" },
+                    "mode": { "type": ["string","null"], "enum": ["safe", "default", "full"], "description": "Context mode. `safe` is the default and excludes credentials unless `full` is explicitly requested." },
+                    "session_id": { "type": ["string","null"] },
+                    "thread_id": { "type": ["string","null"] },
+                    "window_id": { "type": ["string","null"] }
                 }
             }
         },
@@ -161,7 +181,17 @@ pub fn tool_definitions() -> Value {
             }
         },
         { "name": "list_projects", "description": "List all projects with memory counts.", "inputSchema": { "type": "object", "properties": {} } },
-        { "name": "get_stats", "description": "Database statistics: totals, by kind, by project, expired count, db size.", "inputSchema": { "type": "object", "properties": {} } },
+        { "name": "get_stats", "description": "Database statistics: totals, by kind, by project, expired count, db size, plus hygiene signals (missing paths, stale low-value memories, orphan records, etc.).", "inputSchema": { "type": "object", "properties": {} } },
+        {
+            "name": "benchmark_recall",
+            "description": "Run a local recall benchmark on the current memory base. Uses a fixed golden scenario set first, then generated fallback scenarios if coverage is missing. Measures top-1/top-5 hit rate, cross-project leakage, credential leakage in safe mode, and explain consistency.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scenario_limit": { "type": "integer", "default": 12 }
+                }
+            }
+        },
         {
             "name": "get_global_prompt",
             "description": "Load GLOBAL_PROMPT.md. Auto-scans: 1) configured path, 2) ~/.MemoryPilot/GLOBAL_PROMPT.md, 3) project root GLOBAL_PROMPT.md.",
@@ -193,13 +223,14 @@ pub fn tool_definitions() -> Value {
         { "name": "cleanup_expired", "description": "Manually remove all expired memories.", "inputSchema": { "type": "object", "properties": {} } },
         { 
             "name": "run_gc", 
-            "description": "Trigger Garbage Collection manually. Compresses old bugs/snippets and deletes expired.", 
+            "description": "Trigger Garbage Collection manually. Compresses old bugs/snippets and deletes expired. `preview`/`dry_run` returns exact candidate groups with confidence and hygiene signals before mutating anything.", 
             "inputSchema": { 
                 "type": "object", 
                 "properties": {
                     "age_days": { "type": "integer", "default": 30 },
                     "importance_threshold": { "type": "integer", "default": 3 },
-                    "dry_run": { "type": "boolean", "default": false }
+                    "dry_run": { "type": "boolean", "default": false },
+                    "preview": { "type": "boolean", "default": false }
                 } 
             } 
         },
@@ -244,6 +275,7 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "register_project" => handle_register_project(db, args),
         "list_projects" => handle_list_projects(db),
         "get_stats" => handle_stats(db),
+        "benchmark_recall" => handle_benchmark_recall(db, args),
         "get_global_prompt" => handle_global_prompt(db, args),
         "export_memories" => handle_export(db, args),
         "set_config" => handle_set_config(db, args),
@@ -256,11 +288,25 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
     }
 }
 
+fn scope_from_args(args: &Value) -> MemoryScope {
+    MemoryScope {
+        session_id: args.get("session_id").and_then(|v| v.as_str()).map(String::from),
+        thread_id: args.get("thread_id").and_then(|v| v.as_str()).map(String::from),
+        window_id: args.get("window_id").and_then(|v| v.as_str()).map(String::from),
+    }
+}
+
 fn handle_recall(db: &Database, args: &Value) -> Value {
     let project = args.get("project").and_then(|v| v.as_str());
     let working_dir = args.get("working_dir").and_then(|v| v.as_str());
     let hints = args.get("hints").and_then(|v| v.as_str());
-    match db.recall(project, working_dir, hints) {
+    let explain = args.get("explain").and_then(|v| v.as_bool()).unwrap_or(false);
+    let scope = scope_from_args(args);
+    let mode = match RecallMode::from_str(args.get("mode").and_then(|v| v.as_str())) {
+        Ok(mode) => mode,
+        Err(error) => return tool_error(&error),
+    };
+    match db.recall(project, working_dir, hints, mode, explain, &scope) {
         Ok(ctx) => tool_result(&serde_json::to_string_pretty(&ctx).unwrap()),
         Err(e) => tool_error(&e),
     }
@@ -280,8 +326,9 @@ fn handle_add(db: &Database, args: &Value) -> Value {
     let importance = args.get("importance").and_then(|v| v.as_i64()).unwrap_or(3) as i32;
     let expires_at = args.get("expires_at").and_then(|v| v.as_str());
     let metadata = args.get("metadata").filter(|v| !v.is_null());
+    let scope = scope_from_args(args);
 
-    match db.add_memory(content, kind, project, &tags, source, importance, expires_at, metadata) {
+    match db.add_memory(content, kind, project, &tags, source, importance, expires_at, metadata, &scope) {
         Ok((mem, was_merged)) => {
             let mut result = serde_json::to_value(&mem).unwrap_or(json!({}));
             if was_merged { result.as_object_mut().map(|o| o.insert("_merged".into(), json!(true))); }
@@ -313,53 +360,11 @@ fn handle_add_transcript(db: &Database, args: &Value) -> Value {
     let tags: Vec<String> = args.get("tags").and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
     let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("cursor").to_string();
+    let distill = args.get("distill").and_then(|v| v.as_bool()).unwrap_or(true);
+    let scope = scope_from_args(args);
 
-    let transcript_id = uuid::Uuid::new_v4().to_string();
-    let chunk_size = 2000;
-    
-    // Simple word-boundary chunking
-    let mut chunks = Vec::new();
-    let mut current_chunk = String::new();
-    
-    for word in content.split_whitespace() {
-        if current_chunk.len() + word.len() > chunk_size && !current_chunk.is_empty() {
-            chunks.push(current_chunk.clone());
-            current_chunk.clear();
-        }
-        if !current_chunk.is_empty() {
-            current_chunk.push(' ');
-        }
-        current_chunk.push_str(word);
-    }
-    if !current_chunk.is_empty() {
-        chunks.push(current_chunk);
-    }
-
-    let mut bulk_items = Vec::new();
-    for (i, chunk) in chunks.iter().enumerate() {
-        let metadata = json!({
-            "transcript_id": transcript_id,
-            "chunk_index": i,
-            "total_chunks": chunks.len()
-        });
-        
-        bulk_items.push(BulkItem {
-            content: chunk.clone(),
-            kind: "transcript".to_string(),
-            project: project.clone(),
-            tags: Some(tags.clone()),
-            source: source.clone(),
-            importance: Some(3),
-            expires_at: None,
-            metadata: Some(metadata),
-        });
-    }
-
-    match db.add_memories_bulk(&bulk_items) {
-        Ok((added, merged, skipped)) => {
-            tool_result(&format!("Transcript processed into {} chunks. {} added, {} merged (dedup), {} skipped. Transcript ID: {}",
-                chunks.len(), added.len(), merged, skipped, transcript_id))
-        }
+    match db.add_transcript(content, project.as_deref(), &tags, &source, &scope, distill) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
         Err(e) => tool_error(&e),
     }
 }
@@ -414,7 +419,7 @@ fn handle_update(db: &Database, args: &Value) -> Value {
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
     let importance = args.get("importance").and_then(|v| v.as_i64()).map(|i| i as i32);
     let expires_at = args.get("expires_at").and_then(|v| v.as_str());
-    match db.update_memory_full(id, content, kind, tags.as_deref(), importance, expires_at) {
+    match db.update_memory_full(id, content, kind, tags.as_deref(), importance, expires_at, None) {
         Ok(Some(mem)) => tool_result(&serde_json::to_string_pretty(&mem).unwrap()),
         Ok(None) => tool_error(&format!("Not found: {}", id)),
         Err(e) => tool_error(&e),
@@ -445,7 +450,12 @@ fn handle_list(db: &Database, args: &Value) -> Value {
 fn handle_project_context(db: &Database, args: &Value) -> Value {
     let project = args.get("project").and_then(|v| v.as_str());
     let working_dir = args.get("working_dir").and_then(|v| v.as_str());
-    match db.get_project_context(project, working_dir) {
+    let scope = scope_from_args(args);
+    let mode = match RecallMode::from_str(args.get("mode").and_then(|v| v.as_str())) {
+        Ok(mode) => mode,
+        Err(error) => return tool_error(&error),
+    };
+    match db.get_project_context(project, working_dir, mode, &scope) {
         Ok(ctx) => tool_result(&serde_json::to_string_pretty(&ctx).unwrap()),
         Err(e) => tool_error(&e),
     }
@@ -488,6 +498,14 @@ fn handle_stats(db: &Database) -> Value {
     match db.stats() {
         Ok(s) => tool_result(&serde_json::to_string_pretty(&s).unwrap()),
         Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_benchmark_recall(db: &Database, args: &Value) -> Value {
+    let scenario_limit = args.get("scenario_limit").and_then(|v| v.as_u64()).unwrap_or(12) as usize;
+    match db.benchmark_recall(scenario_limit) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(error) => tool_error(&error),
     }
 }
 
@@ -536,7 +554,8 @@ fn handle_run_gc(db: &Database, args: &Value) -> Value {
     let mut config = crate::gc::GcConfig::default();
     if let Some(age) = args.get("age_days").and_then(|v| v.as_i64()) { config.age_days = age; }
     if let Some(imp) = args.get("importance_threshold").and_then(|v| v.as_i64()) { config.importance_threshold = imp as i32; }
-    let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false)
+        || args.get("preview").and_then(|v| v.as_bool()).unwrap_or(false);
     
     match db.run_gc(&config, dry_run) {
         Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),

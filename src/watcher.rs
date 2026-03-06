@@ -179,6 +179,7 @@ pub fn start_watcher(dir: &str) -> Option<Arc<Mutex<FileWatcherState>>> {
                                         5,
                                         None,
                                         None,
+                                        &crate::db::MemoryScope::default(),
                                     );
                                 }
                             }
