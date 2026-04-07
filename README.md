@@ -4,7 +4,7 @@
 
 <p align="center">
   <strong>The most advanced MCP memory server. Period.</strong><br>
-  <sub>Hybrid search (BM25 + fastembed RRF) · Temporal Knowledge Graph · AAAK compression · GraphRAG · Chunked RAG · Auto-Linting · Project brain · HTTP API · Single binary</sub>
+  <sub>Hybrid search (BM25 + fastembed RRF) · Temporal Knowledge Graph · AAAK compression (3x token savings) · GraphRAG · Chunked RAG · Auto-Linting · Project brain · HTTP API · Single binary · Zero API calls</sub>
 </p>
 
 <p align="center">
@@ -12,6 +12,7 @@
   <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust"/>
   <img src="https://img.shields.io/badge/search-Hybrid_RRF-blueviolet" alt="Hybrid RRF"/>
   <img src="https://img.shields.io/badge/embeddings-fastembed_(all--MiniLM--L6--v2)-blue" alt="fastembed"/>
+  <img src="https://img.shields.io/badge/tokens-3x_compression-brightgreen" alt="3x token savings"/>
   <img src="https://img.shields.io/badge/license-Apache_2.0-blue" alt="Apache 2.0"/>
 </p>
 
@@ -19,7 +20,7 @@
 
 ## Why
 
-AI coding assistants forget everything between sessions. MemoryPilot gives them persistent, searchable memory with project awareness, semantic understanding, and automatic knowledge organization.
+AI coding assistants forget everything between sessions. MemoryPilot gives them persistent, searchable memory with project awareness, semantic understanding, and automatic knowledge organization. Built-in AAAK compression reduces token consumption by 3x when loading context, saving you money on every API call.
 
 **vs the best MCP memory servers:**
 
