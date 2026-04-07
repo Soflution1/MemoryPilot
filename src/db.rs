@@ -1,6 +1,7 @@
-/// MemoryPilot v2.1 Database Engine — SQLite + FTS5.
-/// Features: dedup, importance, TTL, bulk ops, export, auto-prompt.
+/// MemoryPilot v4.0 Database Engine — SQLite + FTS5.
+/// Features: dedup, importance, TTL, bulk ops, export, auto-prompt, lazy embedding, content hash.
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -10,6 +11,139 @@ const DB_DIR: &str = ".MemoryPilot";
 const DB_FILE: &str = "memory.db";
 const PROMPT_FILE: &str = "GLOBAL_PROMPT.md";
 const DEDUP_THRESHOLD: f64 = 0.85;
+const EMBED_CACHE_SIZE: usize = 64;
+
+fn content_hash(text: &str) -> String {
+    let mut h: u64 = 14695981039346656037;
+    for b in text.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    format!("{:016x}", h)
+}
+
+// ─── LAZY EMBEDDING QUEUE ────────────────────────────
+// add_memory inserts with embedding=NULL and pushes a job here.
+// A background thread drains the queue and writes embeddings to DB.
+
+struct EmbedJob {
+    id: String,
+    content: String,
+}
+
+static EMBED_QUEUE: OnceLock<Mutex<Vec<EmbedJob>>> = OnceLock::new();
+static EMBED_DB_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+fn embed_queue() -> &'static Mutex<Vec<EmbedJob>> {
+    EMBED_QUEUE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn queue_embedding_job(id: &str, content: &str) {
+    if let Ok(mut q) = embed_queue().lock() {
+        q.push(EmbedJob { id: id.to_string(), content: content.to_string() });
+    }
+    // Signal the background thread (fire-and-forget)
+    ensure_embed_worker();
+}
+
+static EMBED_WORKER_STARTED: OnceLock<()> = OnceLock::new();
+
+fn ensure_embed_worker() {
+    EMBED_WORKER_STARTED.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("embed-worker".into())
+            .spawn(embed_worker_loop)
+            .ok();
+    });
+}
+
+fn embed_worker_loop() {
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let jobs: Vec<EmbedJob> = {
+            let mut q = match embed_queue().lock() {
+                Ok(q) => q,
+                Err(_) => continue,
+            };
+            q.drain(..).collect()
+        };
+
+        if jobs.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            continue;
+        }
+
+        let db_path = match EMBED_DB_PATH.get() {
+            Some(p) => p.clone(),
+            None => continue,
+        };
+
+        let conn = match Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let _ = conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+
+        let texts: Vec<&str> = jobs.iter().map(|j| j.content.as_str()).collect();
+        let embeddings = crate::embedding::embed_batch(&texts);
+
+        for (job, emb) in jobs.iter().zip(embeddings.iter()) {
+            let blob = crate::embedding::vec_to_blob(emb);
+            let hash = content_hash(&job.content);
+            let _ = conn.execute(
+                "UPDATE memories SET embedding = ?1, content_hash = ?2 WHERE id = ?3 AND embedding IS NULL",
+                params![blob, &hash, &job.id],
+            );
+        }
+    }
+}
+
+// ─── EMBEDDING CACHE (LRU) ──────────────────────────
+// Caches query embeddings so repeated searches don't recompute.
+
+struct EmbedCache {
+    entries: Vec<(String, Vec<f32>)>,
+}
+
+impl EmbedCache {
+    fn new() -> Self {
+        Self { entries: Vec::with_capacity(EMBED_CACHE_SIZE) }
+    }
+
+    fn get(&self, text: &str) -> Option<&Vec<f32>> {
+        self.entries.iter().find(|(k, _)| k == text).map(|(_, v)| v)
+    }
+
+    fn insert(&mut self, text: String, emb: Vec<f32>) {
+        if let Some(pos) = self.entries.iter().position(|(k, _)| k == &text) {
+            self.entries.remove(pos);
+        }
+        if self.entries.len() >= EMBED_CACHE_SIZE {
+            self.entries.remove(0);
+        }
+        self.entries.push((text, emb));
+    }
+}
+
+static EMBED_CACHE: OnceLock<Mutex<EmbedCache>> = OnceLock::new();
+
+fn embed_cache() -> &'static Mutex<EmbedCache> {
+    EMBED_CACHE.get_or_init(|| Mutex::new(EmbedCache::new()))
+}
+
+fn cached_embed_text(text: &str) -> Vec<f32> {
+    if let Ok(cache) = embed_cache().lock() {
+        if let Some(emb) = cache.get(text) {
+            return emb.clone();
+        }
+    }
+    let emb = crate::embedding::embed_text(text);
+    if let Ok(mut cache) = embed_cache().lock() {
+        cache.insert(text.to_string(), emb.clone());
+    }
+    emb
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
@@ -92,8 +226,11 @@ impl MemoryScope {
     }
 }
 
+const READ_POOL_SIZE: usize = 4;
+
 pub struct Database {
     conn: Connection,
+    read_pool: Vec<Mutex<Connection>>,
 }
 
 impl Database {
@@ -111,12 +248,39 @@ impl Database {
             PRAGMA cache_size = -8000;
             PRAGMA foreign_keys = ON;
         ").map_err(|e| format!("Pragma: {}", e))?;
-        let db = Self { conn };
+        let _ = EMBED_DB_PATH.set(path.to_path_buf());
+
+        let mut read_pool = Vec::with_capacity(READ_POOL_SIZE);
+        for _ in 0..READ_POOL_SIZE {
+            let rc = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)
+                .map_err(|e| format!("Read pool open: {}", e))?;
+            let _ = rc.execute_batch("PRAGMA cache_size = -4000;");
+            read_pool.push(Mutex::new(rc));
+        }
+
+        let db = Self { conn, read_pool };
         db.init_schema()?;
         db.upgrade_schema()?;
         db.normalize_project_identities()?;
         let _ = db.backfill_embeddings();
         Ok(db)
+    }
+
+    fn read_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        for pooled in &self.read_pool {
+            if let Ok(guard) = pooled.try_lock() {
+                return guard;
+            }
+        }
+        // All busy — wait on first available, handling poison
+        for pooled in &self.read_pool {
+            if let Ok(guard) = pooled.lock() {
+                return guard;
+            }
+        }
+        // Last resort: clear poison on pool[0]
+        self.read_pool[0].clear_poison();
+        self.read_pool[0].lock().expect("read pool irrecoverable")
     }
 
     fn canonical_project_name(name: &str) -> Option<String> {
@@ -460,22 +624,64 @@ impl Database {
     }
 
     fn build_link_boosts(&self) -> std::collections::HashMap<String, f64> {
+        self.build_link_boosts_for(&[])
+    }
+
+    fn build_link_boosts_for(&self, candidate_ids: &[&String]) -> std::collections::HashMap<String, f64> {
         let mut link_boosts = std::collections::HashMap::new();
-        if let Ok(mut stmt) = self.conn.prepare("SELECT target_id, relation_type FROM memory_links") {
-            if let Ok(rows) = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
-                for row in rows.flatten() {
-                    let (target_id, relation_type) = row;
-                    let boost: f64 = match relation_type.as_str() {
-                        "deprecates" => -0.6,
-                        "depends_on" | "implements" | "resolves" | "resolved_by" | "fixed_by" | "fixes" => 0.08,
-                        _ => 0.03,
-                    };
-                    let total = link_boosts.entry(target_id).or_insert(0.0);
-                    *total = (*total + boost).clamp(-0.8_f64, 0.25_f64);
+        let mut rows_data: Vec<(String, String)> = Vec::new();
+
+        if candidate_ids.is_empty() || candidate_ids.len() > 200 {
+            if let Ok(mut stmt) = self.conn.prepare("SELECT target_id, relation_type FROM memory_links") {
+                if let Ok(rows) = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+                    for r in rows.flatten() { rows_data.push(r); }
+                }
+            }
+        } else {
+            let placeholders: Vec<String> = (1..=candidate_ids.len()).map(|i| format!("?{}", i)).collect();
+            let sql = format!("SELECT target_id, relation_type FROM memory_links WHERE target_id IN ({})", placeholders.join(","));
+            if let Ok(mut stmt) = self.conn.prepare(&sql) {
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> = candidate_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+                if let Ok(rows) = stmt.query_map(param_refs.as_slice(), |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+                    for r in rows.flatten() { rows_data.push(r); }
                 }
             }
         }
+
+        for (target_id, relation_type) in rows_data {
+            let boost: f64 = match relation_type.as_str() {
+                "deprecates" => -0.6,
+                "depends_on" | "implements" | "resolves" | "resolved_by" | "fixed_by" | "fixes" => 0.08,
+                _ => 0.03,
+            };
+            let total = link_boosts.entry(target_id).or_insert(0.0);
+            *total = (*total + boost).clamp(-0.8_f64, 0.25_f64);
+        }
         link_boosts
+    }
+
+    fn batch_triple_counts(&self, candidate_ids: &[&String]) -> std::collections::HashMap<String, (i64, i64)> {
+        let mut counts: std::collections::HashMap<String, (i64, i64)> = std::collections::HashMap::new();
+        if candidate_ids.is_empty() { return counts; }
+        let placeholders: Vec<String> = (1..=candidate_ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "SELECT source_memory_id, \
+             SUM(CASE WHEN valid_to IS NULL THEN 1 ELSE 0 END), \
+             SUM(CASE WHEN valid_to IS NOT NULL THEN 1 ELSE 0 END) \
+             FROM knowledge_triples WHERE source_memory_id IN ({}) GROUP BY source_memory_id",
+            placeholders.join(",")
+        );
+        if let Ok(mut stmt) = self.conn.prepare(&sql) {
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> = candidate_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+            if let Ok(rows) = stmt.query_map(param_refs.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            }) {
+                for row in rows.flatten() {
+                    counts.insert(row.0, (row.1, row.2));
+                }
+            }
+        }
+        counts
     }
 
     fn preview_snippet(content: &str) -> String {
@@ -780,6 +986,7 @@ impl Database {
                 expires_at TEXT,
                 metadata TEXT,
                 embedding BLOB,
+                content_hash TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 last_accessed_at TEXT,
@@ -789,6 +996,9 @@ impl Database {
                 source_id TEXT NOT NULL,
                 target_id TEXT NOT NULL,
                 relation_type TEXT NOT NULL DEFAULT 'relates_to',
+                valid_from TEXT,
+                valid_to TEXT,
+                confidence REAL DEFAULT 1.0,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (source_id, target_id),
                 FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE CASCADE,
@@ -801,10 +1011,29 @@ impl Database {
                 memory_id TEXT NOT NULL,
                 entity_kind TEXT NOT NULL,
                 entity_value TEXT NOT NULL,
+                valid_from TEXT,
+                valid_to TEXT,
                 FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_entities_value ON memory_entities(entity_value);
             CREATE INDEX IF NOT EXISTS idx_entities_memory ON memory_entities(memory_id);
+
+            CREATE TABLE IF NOT EXISTS knowledge_triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                valid_from TEXT,
+                valid_to TEXT,
+                confidence REAL DEFAULT 1.0,
+                source_memory_id TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (source_memory_id) REFERENCES memories(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_triples_subject ON knowledge_triples(subject);
+            CREATE INDEX IF NOT EXISTS idx_triples_object ON knowledge_triples(object);
+            CREATE INDEX IF NOT EXISTS idx_triples_valid ON knowledge_triples(valid_from, valid_to);
+
             CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project);
             CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind);
             CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
@@ -848,28 +1077,57 @@ impl Database {
             let _ = self.conn.execute_batch(
                 "ALTER TABLE memories ADD COLUMN embedding BLOB;
                  ALTER TABLE memories ADD COLUMN last_accessed_at TEXT;
-                 ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;
-                 CREATE TABLE IF NOT EXISTS memory_links (
-                     source_id TEXT NOT NULL,
-                     target_id TEXT NOT NULL,
-                     relation_type TEXT NOT NULL DEFAULT 'relates_to',
-                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                     PRIMARY KEY (source_id, target_id),
-                     FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE CASCADE,
-                     FOREIGN KEY (target_id) REFERENCES memories(id) ON DELETE CASCADE
-                 );
-                 CREATE INDEX IF NOT EXISTS idx_links_source ON memory_links(source_id);
-                 CREATE INDEX IF NOT EXISTS idx_links_target ON memory_links(target_id);
-
-                 CREATE TABLE IF NOT EXISTS memory_entities (
-                     memory_id TEXT NOT NULL,
-                     entity_kind TEXT NOT NULL,
-                     entity_value TEXT NOT NULL,
-                     FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
-                 );
-                 CREATE INDEX IF NOT EXISTS idx_entities_value ON memory_entities(entity_value);
-                 CREATE INDEX IF NOT EXISTS idx_entities_memory ON memory_entities(memory_id);"
+                 ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;"
             );
+        }
+        // v4.0: knowledge_triples + temporal columns
+        let _ = self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_links (
+                 source_id TEXT NOT NULL,
+                 target_id TEXT NOT NULL,
+                 relation_type TEXT NOT NULL DEFAULT 'relates_to',
+                 valid_from TEXT,
+                 valid_to TEXT,
+                 confidence REAL DEFAULT 1.0,
+                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 PRIMARY KEY (source_id, target_id),
+                 FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE CASCADE,
+                 FOREIGN KEY (target_id) REFERENCES memories(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_links_source ON memory_links(source_id);
+             CREATE INDEX IF NOT EXISTS idx_links_target ON memory_links(target_id);
+             CREATE TABLE IF NOT EXISTS memory_entities (
+                 memory_id TEXT NOT NULL,
+                 entity_kind TEXT NOT NULL,
+                 entity_value TEXT NOT NULL,
+                 valid_from TEXT,
+                 valid_to TEXT,
+                 FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_entities_value ON memory_entities(entity_value);
+             CREATE INDEX IF NOT EXISTS idx_entities_memory ON memory_entities(memory_id);
+             CREATE TABLE IF NOT EXISTS knowledge_triples (
+                 id TEXT PRIMARY KEY,
+                 subject TEXT NOT NULL,
+                 predicate TEXT NOT NULL,
+                 object TEXT NOT NULL,
+                 valid_from TEXT,
+                 valid_to TEXT,
+                 confidence REAL DEFAULT 1.0,
+                 source_memory_id TEXT,
+                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 FOREIGN KEY (source_memory_id) REFERENCES memories(id) ON DELETE SET NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_triples_subject ON knowledge_triples(subject);
+             CREATE INDEX IF NOT EXISTS idx_triples_object ON knowledge_triples(object);
+             CREATE INDEX IF NOT EXISTS idx_triples_valid ON knowledge_triples(valid_from, valid_to);"
+        );
+        // v4.0.1: content_hash column
+        let has_content_hash: bool = self.conn
+            .prepare("SELECT content_hash FROM memories LIMIT 0")
+            .is_ok();
+        if !has_content_hash {
+            let _ = self.conn.execute_batch("ALTER TABLE memories ADD COLUMN content_hash TEXT;");
         }
         Ok(())
     }
@@ -898,6 +1156,18 @@ impl Database {
     }
     /// Find a near-duplicate in the same project/scope.
     fn find_duplicate(&self, content: &str, project: Option<&str>) -> Result<Option<Memory>, String> {
+        // Fast path: exact content match via hash
+        let hash = content_hash(content);
+        let exact = if let Some(p) = project {
+            self.conn.prepare("SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count FROM memories WHERE content_hash=?1 AND project=?2 LIMIT 1")
+                .ok().and_then(|mut s| s.query_row(params![&hash, p], |r| Ok(row_to_memory(r))).ok())
+        } else {
+            self.conn.prepare("SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count FROM memories WHERE content_hash=?1 AND project IS NULL LIMIT 1")
+                .ok().and_then(|mut s| s.query_row(params![&hash], |r| Ok(row_to_memory(r))).ok())
+        };
+        if let Some(mem) = exact { return Ok(Some(mem)); }
+
+        // Slow path: Jaccard fuzzy match on recent memories
         let norm = Self::normalize(content);
         let memories: Vec<Memory> = if let Some(p) = project {
             let mut stmt = self.conn.prepare(
@@ -905,16 +1175,14 @@ impl Database {
             ).map_err(|e| format!("Dedup: {}", e))?;
             let rows = stmt.query_map(params![p], |r| Ok(row_to_memory(r)))
                 .map_err(|e| format!("Dedup: {}", e))?;
-            let collected: Vec<Memory> = rows.flatten().collect();
-            collected
+            rows.flatten().collect()
         } else {
             let mut stmt = self.conn.prepare(
                 "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count FROM memories WHERE project IS NULL ORDER BY updated_at DESC LIMIT 200"
             ).map_err(|e| format!("Dedup: {}", e))?;
             let rows = stmt.query_map([], |r| Ok(row_to_memory(r)))
                 .map_err(|e| format!("Dedup: {}", e))?;
-            let collected: Vec<Memory> = rows.flatten().collect();
-            collected
+            rows.flatten().collect()
         };
         for mem in memories {
             let mem_norm = Self::normalize(&mem.content);
@@ -1002,6 +1270,142 @@ impl Database {
         Ok(())
     }
 
+    // ─── KNOWLEDGE TRIPLES ─────────────────────────────
+
+    pub fn add_triple(&self, subject: &str, predicate: &str, object: &str,
+                      valid_from: Option<&str>, valid_to: Option<&str>,
+                      confidence: Option<f64>, source_memory_id: Option<&str>) -> Result<serde_json::Value, String> {
+        let sub = subject.to_lowercase().replace(' ', "_");
+        let pred = predicate.to_lowercase().replace(' ', "_");
+        let obj = object.to_lowercase().replace(' ', "_");
+
+        let existing: Option<String> = self.conn.prepare(
+            "SELECT id FROM knowledge_triples WHERE subject=?1 AND predicate=?2 AND object=?3 AND valid_to IS NULL"
+        ).ok().and_then(|mut s| s.query_row(params![&sub, &pred, &obj], |r| r.get(0)).ok());
+
+        if let Some(id) = existing {
+            return Ok(serde_json::json!({"triple_id": id, "already_exists": true, "fact": format!("{} -> {} -> {}", subject, predicate, object)}));
+        }
+
+        let id = format!("t_{}_{}_{}_{}", &sub, &pred, &obj, &Uuid::new_v4().to_string()[..8]);
+        let conf = confidence.unwrap_or(1.0);
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO knowledge_triples (id, subject, predicate, object, valid_from, valid_to, confidence, source_memory_id, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![&id, &sub, &pred, &obj, valid_from, valid_to, conf, source_memory_id, &now]
+        ).map_err(|e| format!("add_triple: {}", e))?;
+        Ok(serde_json::json!({"triple_id": id, "fact": format!("{} -> {} -> {}", subject, predicate, object)}))
+    }
+
+    pub fn invalidate_triple(&self, subject: &str, predicate: &str, object: &str, ended: Option<&str>) -> Result<serde_json::Value, String> {
+        let sub = subject.to_lowercase().replace(' ', "_");
+        let pred = predicate.to_lowercase().replace(' ', "_");
+        let obj = object.to_lowercase().replace(' ', "_");
+        let end_date = ended.unwrap_or(&Utc::now().format("%Y-%m-%d").to_string()).to_string();
+        let changed = self.conn.execute(
+            "UPDATE knowledge_triples SET valid_to=?1 WHERE subject=?2 AND predicate=?3 AND object=?4 AND valid_to IS NULL",
+            params![&end_date, &sub, &pred, &obj]
+        ).map_err(|e| format!("invalidate_triple: {}", e))?;
+        Ok(serde_json::json!({"invalidated": changed, "fact": format!("{} -> {} -> {}", subject, predicate, object), "ended": end_date}))
+    }
+
+    pub fn query_kg_entity(&self, name: &str, as_of: Option<&str>, direction: &str) -> Result<serde_json::Value, String> {
+        let eid = name.to_lowercase().replace(' ', "_");
+        let mut facts = Vec::new();
+
+        if direction == "outgoing" || direction == "both" {
+            let mut sql = "SELECT subject, predicate, object, valid_from, valid_to, confidence, source_memory_id FROM knowledge_triples WHERE subject = ?1".to_string();
+            let mut param_vals: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(eid.clone())];
+            if let Some(date) = as_of {
+                sql += &format!(" AND (valid_from IS NULL OR valid_from <= ?{n}) AND (valid_to IS NULL OR valid_to >= ?{n})", n=param_vals.len()+1);
+                param_vals.push(Box::new(date.to_string()));
+            }
+            if let Ok(mut stmt) = self.conn.prepare(&sql) {
+                let refs: Vec<&dyn rusqlite::types::ToSql> = param_vals.iter().map(|p| p.as_ref()).collect();
+                if let Ok(rows) = stmt.query_map(refs.as_slice(), |r| {
+                    Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?, r.get::<_,Option<String>>(3)?, r.get::<_,Option<String>>(4)?, r.get::<_,f64>(5)?))
+                }) {
+                    for row in rows.flatten() {
+                        facts.push(serde_json::json!({"direction":"outgoing","subject":row.0,"predicate":row.1,"object":row.2,"valid_from":row.3,"valid_to":row.4,"confidence":row.5,"current":row.4.is_none()}));
+                    }
+                }
+            }
+        }
+        if direction == "incoming" || direction == "both" {
+            let mut sql = "SELECT subject, predicate, object, valid_from, valid_to, confidence FROM knowledge_triples WHERE object = ?1".to_string();
+            let mut param_vals: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(eid.clone())];
+            if let Some(date) = as_of {
+                sql += &format!(" AND (valid_from IS NULL OR valid_from <= ?{n}) AND (valid_to IS NULL OR valid_to >= ?{n})", n=param_vals.len()+1);
+                param_vals.push(Box::new(date.to_string()));
+            }
+            if let Ok(mut stmt) = self.conn.prepare(&sql) {
+                let refs: Vec<&dyn rusqlite::types::ToSql> = param_vals.iter().map(|p| p.as_ref()).collect();
+                if let Ok(rows) = stmt.query_map(refs.as_slice(), |r| {
+                    Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?, r.get::<_,Option<String>>(3)?, r.get::<_,Option<String>>(4)?, r.get::<_,f64>(5)?))
+                }) {
+                    for row in rows.flatten() {
+                        facts.push(serde_json::json!({"direction":"incoming","subject":row.0,"predicate":row.1,"object":row.2,"valid_from":row.3,"valid_to":row.4,"confidence":row.5,"current":row.4.is_none()}));
+                    }
+                }
+            }
+        }
+        Ok(serde_json::json!({"entity": name, "as_of": as_of, "facts": facts, "count": facts.len()}))
+    }
+
+    pub fn kg_timeline(&self, entity: Option<&str>) -> Result<serde_json::Value, String> {
+        let mut results = Vec::new();
+        let sql = if let Some(name) = entity {
+            let eid = name.to_lowercase().replace(' ', "_");
+            let mut stmt = self.conn.prepare(
+                "SELECT subject, predicate, object, valid_from, valid_to, confidence FROM knowledge_triples WHERE subject = ?1 OR object = ?1 ORDER BY valid_from ASC NULLS LAST"
+            ).map_err(|e| format!("kg_timeline: {}", e))?;
+            let rows = stmt.query_map(params![&eid], |r| {
+                Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?, r.get::<_,Option<String>>(3)?, r.get::<_,Option<String>>(4)?))
+            }).map_err(|e| format!("kg_timeline: {}", e))?;
+            for r in rows.flatten() {
+                results.push(serde_json::json!({"subject":r.0,"predicate":r.1,"object":r.2,"valid_from":r.3,"valid_to":r.4,"current":r.4.is_none()}));
+            }
+            return Ok(serde_json::json!({"entity": name, "timeline": results, "count": results.len()}));
+        } else {
+            "SELECT subject, predicate, object, valid_from, valid_to FROM knowledge_triples ORDER BY valid_from ASC NULLS LAST LIMIT 100"
+        };
+        if entity.is_none() {
+            let mut stmt = self.conn.prepare(sql).map_err(|e| format!("kg_timeline: {}", e))?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?, r.get::<_,Option<String>>(3)?, r.get::<_,Option<String>>(4)?))
+            }).map_err(|e| format!("kg_timeline: {}", e))?;
+            for r in rows.flatten() {
+                results.push(serde_json::json!({"subject":r.0,"predicate":r.1,"object":r.2,"valid_from":r.3,"valid_to":r.4,"current":r.4.is_none()}));
+            }
+        }
+        Ok(serde_json::json!({"entity": "all", "timeline": results, "count": results.len()}))
+    }
+
+    pub fn kg_stats(&self) -> Result<serde_json::Value, String> {
+        let total: i64 = self.conn.query_row("SELECT COUNT(*) FROM knowledge_triples", [], |r| r.get(0)).unwrap_or(0);
+        let current: i64 = self.conn.query_row("SELECT COUNT(*) FROM knowledge_triples WHERE valid_to IS NULL", [], |r| r.get(0)).unwrap_or(0);
+        let expired = total - current;
+        let mut predicates = Vec::new();
+        if let Ok(mut stmt) = self.conn.prepare("SELECT DISTINCT predicate FROM knowledge_triples ORDER BY predicate") {
+            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                for p in rows.flatten() { predicates.push(p); }
+            }
+        }
+        let mut entities = std::collections::HashSet::new();
+        if let Ok(mut stmt) = self.conn.prepare("SELECT DISTINCT subject FROM knowledge_triples UNION SELECT DISTINCT object FROM knowledge_triples") {
+            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                for e in rows.flatten() { entities.insert(e); }
+            }
+        }
+        Ok(serde_json::json!({
+            "entities": entities.len(),
+            "triples": total,
+            "current_facts": current,
+            "expired_facts": expired,
+            "relationship_types": predicates,
+        }))
+    }
+
     // ─── CRUD ────────────────────────────────────────
 
     /// Add memory with dedup check. Returns (memory, was_merged).
@@ -1030,14 +1434,16 @@ impl Database {
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
         let meta_json = scoped_metadata.as_ref().map(|m| serde_json::to_string(m).unwrap_or_default());
         let imp = importance.clamp(1, 5);
-        let emb = crate::embedding::embed_text(content);
-        let emb_blob = crate::embedding::vec_to_blob(&emb);
+        let hash = content_hash(content);
 
         self.conn.execute(
-            "INSERT INTO memories (id,content,kind,project,tags,source,importance,expires_at,metadata,embedding,created_at,updated_at,access_count)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0)",
-            params![id, content, kind, canonical_project.as_deref(), tags_json, source, imp, expires_at, meta_json, emb_blob, now, now],
+            "INSERT INTO memories (id,content,kind,project,tags,source,importance,expires_at,metadata,embedding,content_hash,created_at,updated_at,access_count)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,?10,?11,?12,0)",
+            params![id, content, kind, canonical_project.as_deref(), tags_json, source, imp, expires_at, meta_json, &hash, now, now],
         ).map_err(|e| format!("Insert: {}", e))?;
+
+        // Queue embedding for background computation
+        queue_embedding_job(&id, content);
 
         // FTS index
         let rowid = self.conn.last_insert_rowid();
@@ -1069,13 +1475,21 @@ impl Database {
         let new_exp = if expires_at.is_some() { expires_at.map(String::from) } else { existing.expires_at.clone() };
         let new_metadata = metadata.cloned().or_else(|| existing.metadata.clone());
         let metadata_json = new_metadata.as_ref().map(|value| serde_json::to_string(value).unwrap_or_default());
-        let emb = crate::embedding::embed_text(new_content);
-        let emb_blob = crate::embedding::vec_to_blob(&emb);
+        let new_hash = content_hash(new_content);
+        let content_changed = content.is_some() && new_content != existing.content;
 
-        self.conn.execute(
-            "UPDATE memories SET content=?1,kind=?2,tags=?3,importance=?4,expires_at=?5,metadata=?6,updated_at=?7,embedding=?8 WHERE id=?9",
-            params![new_content, new_kind, tags_json, new_imp, new_exp, metadata_json, now, emb_blob, id],
-        ).map_err(|e| format!("Update: {}", e))?;
+        if content_changed {
+            self.conn.execute(
+                "UPDATE memories SET content=?1,kind=?2,tags=?3,importance=?4,expires_at=?5,metadata=?6,updated_at=?7,embedding=NULL,content_hash=?8 WHERE id=?9",
+                params![new_content, new_kind, tags_json, new_imp, new_exp, metadata_json, now, &new_hash, id],
+            ).map_err(|e| format!("Update: {}", e))?;
+            queue_embedding_job(id, new_content);
+        } else {
+            self.conn.execute(
+                "UPDATE memories SET content=?1,kind=?2,tags=?3,importance=?4,expires_at=?5,metadata=?6,updated_at=?7 WHERE id=?8",
+                params![new_content, new_kind, tags_json, new_imp, new_exp, metadata_json, now, id],
+            ).map_err(|e| format!("Update: {}", e))?;
+        }
 
         // Rebuild FTS
         if let Ok(rowid) = self.conn.query_row::<i64, _, _>(
@@ -1239,6 +1653,7 @@ impl Database {
         match kind {
             "preference" => 3,
             "decision" => 3,
+            "milestone" => 2,
             "bug" => 2,
             "todo" => 2,
             "fact" => 3,
@@ -1267,11 +1682,14 @@ impl Database {
 
         let preference_markers = [
             "always", "never", "prefer", "do not", "don't", "must", "should", "need to",
-            "toujours", "ne jamais", "je veux", "il faut", "pas de",
+            "my rule", "i like", "i hate", "convention",
+            "toujours", "ne jamais", "je veux", "il faut", "pas de", "je préfère",
         ];
         let decision_markers = [
+            "decided", "chose", "switched to", "instead of", "trade-off", "because we",
             "we will", "we'll", "will use", "use ", "uses ", "keep ", "switch ", "migrate ",
-            "supports ", "store ", "now supports", "on va", "garder", "utiliser", "choisir",
+            "supports ", "store ", "now supports",
+            "on va", "garder", "utiliser", "choisir", "on a décidé",
         ];
         let todo_markers = [
             "todo", "next step", "follow up", "remaining", "pending", "should add",
@@ -1279,19 +1697,39 @@ impl Database {
         ];
         let bug_markers = [
             "bug", "error", "failed", "fails", "failing", "panic", "crash", "not found",
-            "cannot", "doesn't work", "does not work", "ne marche", "erreur", "échoue",
+            "cannot", "doesn't work", "does not work", "broken", "root cause", "workaround",
+            "ne marche", "erreur", "échoue", "cassé",
         ];
+        let milestone_markers = [
+            "it works", "breakthrough", "figured out", "shipped", "deployed", "released",
+            "completed", "done", "finally", "working now", "launched", "resolved",
+            "ça marche", "terminé", "fini", "déployé", "livré",
+        ];
+        let resolution_markers = ["fixed", "solved", "resolved", "patched", "corrected", "réglé", "corrigé"];
 
         let contains_any = |markers: &[&str]| markers.iter().any(|marker| lowered.contains(marker));
+        let count_matches = |markers: &[&str]| markers.iter().filter(|marker| lowered.contains(**marker)).count() as i32;
 
-        let (kind, importance, score) = if contains_any(&preference_markers) && role == Some("user") {
-            ("preference", 5, 16 + entity_bonus)
-        } else if contains_any(&bug_markers) {
-            ("bug", 4, 14 + entity_bonus + if has_file { 2 } else { 0 })
-        } else if contains_any(&todo_markers) || (role == Some("assistant") && lowered.contains("next")) {
-            ("todo", 3, 11 + entity_bonus)
-        } else if contains_any(&decision_markers) && (has_file || entity_bonus > 0 || role.is_some()) {
-            ("decision", 4, 13 + entity_bonus + if role == Some("user") { 1 } else { 0 })
+        let pref_score = count_matches(&preference_markers);
+        let dec_score = count_matches(&decision_markers);
+        let bug_score = count_matches(&bug_markers);
+        let todo_score = count_matches(&todo_markers);
+        let mile_score = count_matches(&milestone_markers);
+        let resolution_hits = count_matches(&resolution_markers);
+
+        // Disambiguate: a bug with resolution markers becomes a milestone
+        let is_resolved_problem = bug_score > 0 && resolution_hits > 0;
+
+        let (kind, importance, score) = if contains_any(&preference_markers) && role == Some("user") && pref_score >= 1 {
+            ("preference", 5, 16 + entity_bonus + pref_score)
+        } else if is_resolved_problem || (mile_score >= 1 && bug_score == 0) {
+            ("milestone", 4, 15 + entity_bonus + mile_score + resolution_hits)
+        } else if bug_score >= 1 && !is_resolved_problem {
+            ("bug", 4, 14 + entity_bonus + bug_score + if has_file { 2 } else { 0 })
+        } else if dec_score >= 1 && (has_file || entity_bonus > 0 || role.is_some()) {
+            ("decision", 4, 13 + entity_bonus + dec_score + if role == Some("user") { 1 } else { 0 })
+        } else if todo_score >= 1 || (role == Some("assistant") && lowered.contains("next")) {
+            ("todo", 3, 11 + entity_bonus + todo_score)
         } else if (entity_bonus >= 2 || has_file) && lowered.contains("safe")
             || lowered.contains("mode")
             || lowered.contains("benchmark")
@@ -1469,7 +1907,7 @@ impl Database {
         // Clean expired before search
         let _ = self.cleanup_expired();
 
-        let query_emb = crate::embedding::embed_text(query);
+        let query_emb = cached_embed_text(query);
 
         // 1. BM25 Search
         let mut conditions = vec!["memories_fts MATCH ?1".to_string()];
@@ -1512,53 +1950,60 @@ impl Database {
             rank += 1;
         }
 
-        // 2. Vector Search (Fetch embeddings matching filters)
-        let mut vec_conditions = Vec::new();
-        let mut vec_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(p) = canonical_project.as_deref() {
-            vec_conditions.push(format!("project = ?{}", vec_params.len() + 1));
-            vec_params.push(Box::new(p.to_string()));
-        }
-        if let Some(k) = kind {
-            vec_conditions.push(format!("kind = ?{}", vec_params.len() + 1));
-            vec_params.push(Box::new(k.to_string()));
-        }
-        let vec_where = if vec_conditions.is_empty() { String::new() } else { format!("WHERE {}", vec_conditions.join(" AND ")) };
-        let vec_sql = format!("SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count,embedding FROM memories {}", vec_where);
-        let mut stmt2 = self.conn.prepare(&vec_sql).map_err(|e| format!("Vector Search: {}", e))?;
-        let vec_refs: Vec<&dyn rusqlite::types::ToSql> = vec_params.iter().map(|p| p.as_ref()).collect();
-        
-        let mut vector_scores: Vec<(String, f32)> = Vec::new();
-        let rows2 = stmt2.query_map(vec_refs.as_slice(), |row| {
-            let mem = row_to_memory(row);
-            let blob: Option<Vec<u8>> = row.get(13)?;
-            Ok((mem, blob))
-        }).map_err(|e| format!("Vector Search error: {}", e))?;
-        
-        for r in rows2.flatten() {
-            let (mem, blob) = r;
-            all_memories.entry(mem.id.clone()).or_insert_with(|| mem.clone());
-            if let Some(b) = blob {
-                let emb = crate::embedding::blob_to_vec(&b);
-                let score = crate::embedding::cosine_similarity(&query_emb, &emb);
-                vector_scores.push((mem.id, score));
-            } else {
-                vector_scores.push((mem.id, 0.0));
+        // 2. Vector Search (read pool connection, scoped)
+        let vector_results = {
+            let mut vec_conditions = Vec::new();
+            let mut vec_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            if let Some(p) = canonical_project.as_deref() {
+                vec_conditions.push(format!("project = ?{}", vec_params.len() + 1));
+                vec_params.push(Box::new(p.to_string()));
             }
-        }
-        
-        // Sort vector scores descending
-        vector_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let mut vector_results = std::collections::HashMap::new();
-        for (i, (id, _)) in vector_scores.iter().take(100).enumerate() {
-            vector_results.insert(id.clone(), i + 1);
-        }
+            if let Some(k) = kind {
+                vec_conditions.push(format!("kind = ?{}", vec_params.len() + 1));
+                vec_params.push(Box::new(k.to_string()));
+            }
+            let vec_where = if vec_conditions.is_empty() { String::new() } else { format!("WHERE {}", vec_conditions.join(" AND ")) };
+            let vec_sql = format!("SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count,embedding FROM memories {}", vec_where);
+            let rconn = self.read_conn();
+            let mut stmt2 = rconn.prepare(&vec_sql).map_err(|e| format!("Vector Search: {}", e))?;
+            let vec_refs: Vec<&dyn rusqlite::types::ToSql> = vec_params.iter().map(|p| p.as_ref()).collect();
+
+            let mut vector_scores: Vec<(String, f32)> = Vec::new();
+            let rows2 = stmt2.query_map(vec_refs.as_slice(), |row| {
+                let mem = row_to_memory(row);
+                let blob: Option<Vec<u8>> = row.get(13)?;
+                Ok((mem, blob))
+            }).map_err(|e| format!("Vector Search error: {}", e))?;
+
+            for r in rows2.flatten() {
+                let (mem, blob) = r;
+                all_memories.entry(mem.id.clone()).or_insert_with(|| mem.clone());
+                if let Some(b) = blob {
+                    let emb = crate::embedding::blob_to_vec(&b);
+                    let score = crate::embedding::cosine_similarity(&query_emb, &emb);
+                    vector_scores.push((mem.id, score));
+                } else {
+                    vector_scores.push((mem.id, 0.0));
+                }
+            }
+
+            vector_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let mut vr = std::collections::HashMap::new();
+            for (i, (id, _)) in vector_scores.iter().take(100).enumerate() {
+                vr.insert(id.clone(), i + 1);
+            }
+            vr
+        };
 
         // 3. RRF Fusion
         let mut rrf_scores: Vec<(String, f64)> = Vec::new();
         
-        // Fetch graph links for PageRank-like boost
-        let link_boosts = self.build_link_boosts();
+        // Fetch graph links for PageRank-like boost (scoped to candidates)
+        let candidate_ids: Vec<&String> = all_memories.keys().collect();
+        let link_boosts = self.build_link_boosts_for(&candidate_ids);
+
+        // Batch-query knowledge triple counts (avoids N+1)
+        let triple_counts = self.batch_triple_counts(&candidate_ids);
         
         for (id, mem) in &all_memories {
             let bm25_rank = bm25_results.get(id).copied().unwrap_or(1000);
@@ -1595,6 +2040,19 @@ impl Database {
                     score *= 0.1; // penalize if tags are requested but don't match
                 }
             }
+
+            // Penalize memories linked to expired knowledge triples (batch-preloaded)
+            if let Some(&(active, expired)) = triple_counts.get(id.as_str()) {
+                if expired > 0 {
+                    if active == 0 {
+                        score *= 0.3;
+                    } else {
+                        let ratio = active as f64 / (active + expired) as f64;
+                        score *= 0.5 + (ratio * 0.5);
+                    }
+                }
+            }
+
             rrf_scores.push((id.clone(), score));
         }
 
@@ -1685,8 +2143,15 @@ impl Database {
     // ─── TTL / EXPIRATION ─────────────────────────────
 
     pub fn cleanup_expired(&self) -> Result<usize, String> {
+        static LAST_CLEANUP: OnceLock<Mutex<std::time::Instant>> = OnceLock::new();
+        let last = LAST_CLEANUP.get_or_init(|| Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(120)));
+        if let Ok(mut ts) = last.lock() {
+            if ts.elapsed() < std::time::Duration::from_secs(60) {
+                return Ok(0);
+            }
+            *ts = std::time::Instant::now();
+        }
         let now = Utc::now().to_rfc3339();
-        // Delete FTS entries first
         let _ = self.conn.execute(
             "DELETE FROM memories_fts WHERE rowid IN (SELECT rowid FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?1)",
             params![now]);
@@ -2018,32 +2483,112 @@ impl Database {
     // ─── PROJECT CONTEXT ──────────────────────────────
 
     pub fn backfill_embeddings(&self) -> Result<usize, String> {
-        let mut count = 0;
-        let mut stmt = self.conn.prepare("SELECT id, content FROM memories WHERE embedding IS NULL")
+        self.backfill_embeddings_inner(false)
+    }
+
+    pub fn backfill_embeddings_force(&self) -> Result<usize, String> {
+        self.backfill_embeddings_inner(true)
+    }
+
+    fn backfill_embeddings_inner(&self, force: bool) -> Result<usize, String> {
+        let sql = if force {
+            "SELECT id, content, content_hash FROM memories"
+        } else {
+            "SELECT id, content, content_hash FROM memories WHERE embedding IS NULL"
+        };
+        let mut stmt = self.conn.prepare(sql)
             .map_err(|e| format!("Backfill prepare: {}", e))?;
-        
+
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
         }).map_err(|e| format!("Backfill query: {}", e))?;
-        
-        let mut updates = Vec::new();
+
+        let mut to_embed: Vec<(String, String)> = Vec::new();
+        let mut skipped = 0usize;
         for r in rows.flatten() {
-            updates.push(r);
+            let (id, content, existing_hash) = r;
+            let new_hash = content_hash(&content);
+            if force && existing_hash.as_deref() == Some(&new_hash) {
+                // Content unchanged — check if embedding already exists
+                let has_emb: bool = self.conn.query_row(
+                    "SELECT embedding IS NOT NULL FROM memories WHERE id = ?1",
+                    params![&id], |r| r.get(0)
+                ).unwrap_or(false);
+                if has_emb {
+                    skipped += 1;
+                    continue;
+                }
+            }
+            to_embed.push((id, content));
         }
-        
-        for (id, content) in updates {
-            let emb = crate::embedding::embed_text(&content);
-            let blob = crate::embedding::vec_to_blob(&emb);
+
+        if to_embed.is_empty() {
+            if skipped > 0 {
+                eprintln!("  Skipped {} memories (content unchanged, embedding exists)", skipped);
+            }
+            return Ok(0);
+        }
+
+        eprintln!("  Computing embeddings for {} memories (skipped {} unchanged)...", to_embed.len(), skipped);
+
+        let texts: Vec<&str> = to_embed.iter().map(|(_, c)| c.as_str()).collect();
+        let embeddings = crate::embedding::embed_batch(&texts);
+        let mut count = 0;
+        for ((id, content), emb) in to_embed.iter().zip(embeddings.iter()) {
+            let blob = crate::embedding::vec_to_blob(emb);
+            let hash = content_hash(content);
             let _ = self.conn.execute(
-                "UPDATE memories SET embedding = ?1 WHERE id = ?2",
-                params![blob, id]
+                "UPDATE memories SET embedding = ?1, content_hash = ?2 WHERE id = ?3",
+                params![blob, &hash, id]
             );
             count += 1;
         }
         Ok(count)
     }
 
-    pub fn get_project_brain(&self, project: &str, max_tokens: Option<usize>) -> Result<serde_json::Value, String> {
+    // ─── AAAK-STYLE COMPRESSION ─────────────────────────
+
+    fn compress_memory(mem: &Memory) -> String {
+        let kind_short = match mem.kind.as_str() {
+            "decision" => "DEC",
+            "preference" => "PREF",
+            "bug" => "BUG",
+            "pattern" => "PAT",
+            "credential" => "CRED",
+            "snippet" => "SNIP",
+            "todo" => "TODO",
+            "note" => "NOTE",
+            "fact" => "FACT",
+            "transcript" => "TXN",
+            "architecture" => "ARCH",
+            "milestone" => "MILE",
+            "problem" => "PROB",
+            _ => "MEM",
+        };
+        let truncated = if mem.content.len() > 200 {
+            format!("{}...", &mem.content[..200])
+        } else {
+            mem.content.clone()
+        };
+        let tags_str = if mem.tags.is_empty() { String::new() } else { format!(" | tags:{}", mem.tags.join(",")) };
+        let proj_str = mem.project.as_ref().map(|p| format!(" | proj:{}", p)).unwrap_or_default();
+        format!("[{}:{}] {}{}{}", kind_short, mem.importance, truncated.replace('\n', " "), tags_str, proj_str)
+    }
+
+    fn compress_memories(mems: &[Memory]) -> String {
+        mems.iter().map(Self::compress_memory).collect::<Vec<_>>().join("\n")
+    }
+
+    fn compress_strings(kind: &str, items: &[String]) -> String {
+        if items.is_empty() { return String::new(); }
+        let tag = kind.to_uppercase();
+        items.iter().enumerate().map(|(i, s)| {
+            let truncated = if s.len() > 150 { format!("{}...", &s[..150]) } else { s.clone() };
+            format!("[{}:{}] {}", tag, i + 1, truncated.replace('\n', " "))
+        }).collect::<Vec<_>>().join("\n")
+    }
+
+    pub fn get_project_brain(&self, project: &str, max_tokens: Option<usize>, compact: bool) -> Result<serde_json::Value, String> {
         let canonical_project = Self::canonical_project_name(project).ok_or("Project name cannot be empty")?;
         let max_t = max_tokens.unwrap_or(1500);
         let max_chars = max_t * 4;
@@ -2108,6 +2653,29 @@ impl Database {
             }
         }
 
+        // Team members (person entities)
+        let mut team_members = Vec::new();
+        if let Ok(mut stmt) = self.conn.prepare("SELECT DISTINCT entity_value FROM memory_entities e JOIN memories m ON e.memory_id = m.id WHERE m.project = ?1 AND e.entity_kind = 'person' LIMIT 20") {
+            if let Ok(rows) = stmt.query_map(params![&canonical_project], |r| r.get::<_, String>(0)) {
+                for person in rows.flatten() {
+                    team_members.push(person);
+                }
+            }
+        }
+
+        if compact {
+            let mut lines = Vec::new();
+            lines.push(format!("# {} brain", canonical_project));
+            if !tech_stack.is_empty() { lines.push(format!("STACK: {}", tech_stack.join(", "))); }
+            if !key_components.is_empty() { lines.push(format!("COMPONENTS: {}", key_components.join(", "))); }
+            if !team_members.is_empty() { lines.push(format!("TEAM: {}", team_members.join(", "))); }
+            if !arch_content.is_empty() { lines.push(Self::compress_strings("ARCH", &arch_content)); }
+            if !dec_content.is_empty() { lines.push(Self::compress_strings("DEC", &dec_content)); }
+            if !bug_content.is_empty() { lines.push(Self::compress_strings("BUG", &bug_content)); }
+            if !recent_content.is_empty() { lines.push(Self::compress_strings("RECENT", &recent_content)); }
+            return Ok(serde_json::json!({ "compact": lines.join("\n"), "approx_tokens_used": lines.join("\n").len() / 4 }));
+        }
+
         Ok(serde_json::json!({
             "project": canonical_project,
             "tech_stack": tech_stack,
@@ -2116,6 +2684,7 @@ impl Database {
             "active_bugs_known": bug_content,
             "recent_changes": recent_content,
             "key_components": key_components,
+            "team_members": team_members,
             "approx_tokens_used": current_chars / 4
         }))
     }
@@ -2162,7 +2731,7 @@ impl Database {
 
     /// One-shot context loader for new conversations.
     /// Combines: project context, global prompt, critical memories, and optional hint search.
-    pub fn recall(&self, project: Option<&str>, working_dir: Option<&str>, hints: Option<&str>, mode: RecallMode, explain: bool, scope: &MemoryScope) -> Result<serde_json::Value, String> {
+    pub fn recall(&self, project: Option<&str>, working_dir: Option<&str>, hints: Option<&str>, mode: RecallMode, explain: bool, compact: bool, scope: &MemoryScope) -> Result<serde_json::Value, String> {
         // ~4 chars per token — 800 token budget = 3200 chars for memories
         const TOKEN_BUDGET_CHARS: usize = 3200;
 
@@ -2381,6 +2950,30 @@ impl Database {
             for memory in &decisions {
                 selected_memories_for_explain.push(self.recall_explanation(memory, "decision", proj_ref, mode, None, &link_boosts));
             }
+        }
+
+        if compact {
+            let mut lines = Vec::new();
+            lines.push(format!("# recall | proj:{} | mode:{}", proj_ref.unwrap_or("none"), mode.as_str()));
+            if !critical.is_empty() { lines.push(format!("--- critical ---\n{}", Self::compress_memories(&critical))); }
+            let hint_mems: Vec<Memory> = hint_results.iter().map(|r| r.memory.clone()).collect();
+            if !hint_mems.is_empty() { lines.push(format!("--- hints ---\n{}", Self::compress_memories(&hint_mems))); }
+            if !scope_memories.is_empty() { lines.push(format!("--- scope ---\n{}", Self::compress_memories(&scope_memories))); }
+            if !proj_memories.is_empty() { lines.push(format!("--- project ---\n{}", Self::compress_memories(&proj_memories))); }
+            if !prefs.is_empty() { lines.push(format!("--- prefs ---\n{}", Self::compress_memories(&prefs))); }
+            if !patterns.is_empty() { lines.push(format!("--- patterns ---\n{}", Self::compress_memories(&patterns))); }
+            if !decisions.is_empty() { lines.push(format!("--- decisions ---\n{}", Self::compress_memories(&decisions))); }
+            if let Some(gp) = &global_prompt {
+                let gp_short = if gp.len() > 500 { format!("{}...", &gp[..500]) } else { gp.clone() };
+                lines.push(format!("--- global_prompt ---\n{}", gp_short));
+            }
+            return Ok(serde_json::json!({
+                "status": "recalled",
+                "mode": mode.as_str(),
+                "project": proj_ref.unwrap_or("none"),
+                "compact": lines.join("\n"),
+                "stats": { "total_memories": total, "projects": projects_count },
+            }));
         }
 
         let mut response = serde_json::json!({
@@ -2740,6 +3333,7 @@ impl Database {
                 Some(&scenario.query),
                 scenario.mode,
                 true,
+                false,
                 &MemoryScope::default(),
             )?;
 
@@ -3167,10 +3761,10 @@ mod tests {
                 .expect("add decision");
 
             let safe = db
-                .recall(Some("Planify"), None, Some("token"), RecallMode::Safe, false, &MemoryScope::default())
+                .recall(Some("Planify"), None, Some("token"), RecallMode::Safe, false, false, &MemoryScope::default())
                 .expect("safe recall");
             let full = db
-                .recall(Some("Planify"), None, Some("token"), RecallMode::Full, false, &MemoryScope::default())
+                .recall(Some("Planify"), None, Some("token"), RecallMode::Full, false, false, &MemoryScope::default())
                 .expect("full recall");
 
             let safe_text = serde_json::to_string(&safe).expect("safe json");
@@ -3203,7 +3797,7 @@ mod tests {
                 .expect("add decision");
 
             let explained = db
-                .recall(Some("Planify"), None, Some("SvelteKit"), RecallMode::Safe, true, &MemoryScope::default())
+                .recall(Some("Planify"), None, Some("SvelteKit"), RecallMode::Safe, true, false, &MemoryScope::default())
                 .expect("explained recall");
 
             let explain = explained.get("explain").expect("explain block");
@@ -3361,7 +3955,7 @@ mod tests {
                 .expect("add generic memory");
 
             let recall = db
-                .recall(Some("planify"), None, None, RecallMode::Safe, true, &scope)
+                .recall(Some("planify"), None, None, RecallMode::Safe, true, false, &scope)
                 .expect("scoped recall");
 
             let scope_context = recall
@@ -3566,6 +4160,7 @@ ASSISTANT: We'll add a benchmark_recall tool and a --benchmark-recall CLI comman
                     Some("benchmark_recall safe mode credentials"),
                     RecallMode::Safe,
                     true,
+                    false,
                     &scope,
                 )
                 .expect("recall");

@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
-/// MemoryPilot v3.1 — God-Tier MCP memory server.
-/// Hybrid search (BM25+TF-IDF RRF), Knowledge Graph, GC, Project Brain, File Watcher.
+/// MemoryPilot v4.0 — God-Tier MCP memory server.
+/// Hybrid search (BM25 + fastembed/TF-IDF RRF), Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server.
 /// (c) SOFLUTION LTD — MIT License
 mod db;
 mod protocol;
@@ -10,6 +10,8 @@ mod embedding;
 mod gc;
 mod graph;
 mod watcher;
+#[cfg(feature = "http")]
+mod http;
 
 use std::io::{self, BufRead, Write};
 use protocol::{JsonRpcRequest, JsonRpcResponse};
@@ -28,8 +30,17 @@ fn main() {
     if args.iter().any(|a| a == "--version" || a == "-v") { println!("MemoryPilot v{}", VERSION); return; }
     if args.iter().any(|a| a == "--help" || a == "-h") { print_help(); return; }
     if args.iter().any(|a| a == "--migrate") { run_migrate(); return; }
+    if args.iter().any(|a| a == "--backfill-force") { run_backfill_force(); return; }
     if args.iter().any(|a| a == "--backfill") { run_backfill(); return; }
     if args.iter().any(|a| a == "--benchmark-recall") { run_benchmark_recall(&args); return; }
+    #[cfg(feature = "http")]
+    {
+        if let Some(pos) = args.iter().position(|a| a == "--http") {
+            let port = args.get(pos + 1).and_then(|v| v.parse::<u16>().ok()).unwrap_or(7437);
+            run_http_server(port);
+            return;
+        }
+    }
     run_mcp_server();
 }
 
@@ -91,9 +102,28 @@ fn run_migrate() {
 }
 
 fn run_backfill() {
+    let engine = if crate::embedding::is_fastembed_active() { "fastembed (all-MiniLM-L6-v2)" } else { "TF-IDF" };
+    eprintln!("Embedding engine: {}", engine);
     let db = match db::Database::open() { Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); } };
     match db.backfill_embeddings() {
-        Ok(n) => println!("✓ Generated and saved embeddings for {} existing memories.", n),
+        Ok(n) => println!("✓ Generated embeddings for {} memories (missing only).", n),
+        Err(e) => { eprintln!("✗ Failed: {}", e); std::process::exit(1); }
+    }
+}
+
+#[cfg(feature = "http")]
+fn run_http_server(port: u16) {
+    let db = match db::Database::open() { Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); } };
+    let db_arc = std::sync::Arc::new(db);
+    http::start_http_server(db_arc, port);
+}
+
+fn run_backfill_force() {
+    let engine = if crate::embedding::is_fastembed_active() { "fastembed (all-MiniLM-L6-v2)" } else { "TF-IDF" };
+    eprintln!("Embedding engine: {} (force overwrite ALL)", engine);
+    let db = match db::Database::open() { Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); } };
+    match db.backfill_embeddings_force() {
+        Ok(n) => println!("✓ Regenerated embeddings for ALL {} memories.", n),
         Err(e) => { eprintln!("✗ Failed: {}", e); std::process::exit(1); }
     }
 }
@@ -115,14 +145,16 @@ fn print_help() {
     println!("MemoryPilot v{} — MCP memory server with SQLite FTS5", VERSION);
     println!();
     println!("USAGE:");
-    println!("  MemoryPilot              Start MCP stdio server");
-    println!("  MemoryPilot --migrate    Migrate v1 JSON data to SQLite");
-    println!("  MemoryPilot --backfill   Compute missing TF-IDF embeddings");
+    println!("  MemoryPilot                  Start MCP stdio server");
+    println!("  MemoryPilot --migrate        Migrate v1 JSON data to SQLite");
+    println!("  MemoryPilot --backfill       Compute missing embeddings");
+    println!("  MemoryPilot --backfill-force Recompute ALL embeddings (use after switching engine)");
+    println!("  MemoryPilot --http [PORT]    Start HTTP server (default: 7437, requires --features http)");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
-    println!("  MemoryPilot --version    Show version");
-    println!("  MemoryPilot --help       Show this help");
+    println!("  MemoryPilot --version        Show version");
+    println!("  MemoryPilot --help           Show this help");
     println!();
-    println!("MCP TOOLS (23):");
+    println!("MCP TOOLS (28):");
     println!("  recall              Load all context in one shot (start here)");
     println!("  get_project_brain   Instant project summary (<1500 tokens)");
     println!("  search_memory       Hybrid BM25 + TF-IDF RRF search");
@@ -147,8 +179,14 @@ fn print_help() {
     println!("  migrate_v1          Import from v1 JSON files");
     println!("  toggle_auto_lint    Enable or disable self-healing lint memory");
     println!("  get_file_context    Load memories for recent file changes");
+    println!("  kg_add              Add a fact triple to the knowledge graph");
+    println!("  kg_invalidate       Mark a fact as ended/expired");
+    println!("  kg_query            Query entity relationships with temporal filter");
+    println!("  kg_timeline         Chronological story of an entity");
+    println!("  kg_stats            Knowledge graph overview");
     println!();
-    println!("STORAGE:  ~/.MemoryPilot/memory.db");
-    println!("SEARCH:   Hybrid BM25 + TF-IDF RRF + graph boost + watcher context");
-    println!("BUILT BY: SOFLUTION LTD");
+    println!("STORAGE:    ~/.MemoryPilot/memory.db");
+    println!("SEARCH:     Hybrid BM25 + vector RRF + KG boost + watcher context");
+    println!("EMBEDDINGS: fastembed (all-MiniLM-L6-v2) | TF-IDF fallback");
+    println!("BUILT BY:   SOFLUTION LTD");
 }

@@ -6,6 +6,7 @@ use crate::protocol::{tool_result, tool_error};
 const VALID_KINDS: &[&str] = &[
     "fact", "preference", "decision", "pattern", "snippet",
     "bug", "credential", "todo", "note", "transcript",
+    "milestone", "architecture", "problem",
 ];
 
 pub fn tool_definitions() -> Value {
@@ -21,6 +22,7 @@ pub fn tool_definitions() -> Value {
                     "hints": { "type": ["string","null"], "description": "Keywords about current task for targeted memory search" },
                     "mode": { "type": ["string","null"], "enum": ["safe", "default", "full"], "description": "Recall mode. `safe` is the default and excludes credentials unless `full` is explicitly requested." },
                     "explain": { "type": ["boolean","null"], "description": "When true, include why each memory was selected: source, search score, recency, access boost, graph boost, and project match." },
+                    "compact": { "type": ["boolean","null"], "description": "When true, output uses compressed shorthand (~3x fewer tokens). Default false." },
                     "session_id": { "type": ["string","null"], "description": "Optional session scope for prioritizing same-session memories." },
                     "thread_id": { "type": ["string","null"], "description": "Optional thread scope for prioritizing the same conversation." },
                     "window_id": { "type": ["string","null"], "description": "Optional window scope for prioritizing memories from the same Cursor window." }
@@ -167,7 +169,8 @@ pub fn tool_definitions() -> Value {
                 "properties": {
                     "project": { "type": ["string","null"], "description": "Project name (or null for auto-detect)" },
                     "working_dir": { "type": ["string","null"], "description": "Auto-detect project from path" },
-                    "max_tokens": { "type": "integer", "description": "Dynamic budget. Default is 1500" }
+                    "max_tokens": { "type": "integer", "description": "Dynamic budget. Default is 1500" },
+                    "compact": { "type": ["boolean","null"], "description": "Compressed shorthand output (~3x fewer tokens). Default false." }
                 }
             }
         },
@@ -255,6 +258,65 @@ pub fn tool_definitions() -> Value {
                 },
                 "required": ["working_dir"]
             }
+        },
+        {
+            "name": "kg_add",
+            "description": "Add a fact triple to the knowledge graph (subject -> predicate -> object). Deduplicates active triples. Use valid_from/valid_to for temporal facts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "subject": { "type": "string", "description": "Entity or concept (e.g. 'MemoryPilot')" },
+                    "predicate": { "type": "string", "description": "Relationship type (e.g. 'uses', 'built_with', 'depends_on')" },
+                    "object": { "type": "string", "description": "Target entity (e.g. 'SQLite')" },
+                    "valid_from": { "type": ["string","null"], "description": "When this fact became true (ISO date)" },
+                    "valid_to": { "type": ["string","null"], "description": "When this fact stopped being true (ISO date)" },
+                    "confidence": { "type": ["number","null"], "description": "Confidence 0.0-1.0 (default 1.0)" },
+                    "source_memory_id": { "type": ["string","null"], "description": "Link to source memory" }
+                },
+                "required": ["subject", "predicate", "object"]
+            }
+        },
+        {
+            "name": "kg_invalidate",
+            "description": "Mark a knowledge triple as ended/expired. The fact is preserved but marked as no longer current.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "subject": { "type": "string" },
+                    "predicate": { "type": "string" },
+                    "object": { "type": "string" },
+                    "ended": { "type": ["string","null"], "description": "End date (defaults to today)" }
+                },
+                "required": ["subject", "predicate", "object"]
+            }
+        },
+        {
+            "name": "kg_query",
+            "description": "Query all relationships for an entity. Optionally filter by time window.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entity": { "type": "string", "description": "Entity name to query" },
+                    "as_of": { "type": ["string","null"], "description": "Show facts valid at this date (ISO date)" },
+                    "direction": { "type": "string", "default": "both", "enum": ["outgoing", "incoming", "both"] }
+                },
+                "required": ["entity"]
+            }
+        },
+        {
+            "name": "kg_timeline",
+            "description": "Chronological timeline of all facts for an entity, showing when things became true and expired.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entity": { "type": ["string","null"], "description": "Entity name (null for all entities, limited to 100)" }
+                }
+            }
+        },
+        {
+            "name": "kg_stats",
+            "description": "Knowledge graph overview: entity count, triple count, current vs expired facts, relationship types.",
+            "inputSchema": { "type": "object", "properties": {} }
         }
     ]})
 }
@@ -284,6 +346,11 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "run_gc" => handle_run_gc(db, args),
         "toggle_auto_lint" => handle_toggle_lint(args),
         "get_file_context" => handle_get_file_context(db, args),
+        "kg_add" => handle_kg_add(db, args),
+        "kg_invalidate" => handle_kg_invalidate(db, args),
+        "kg_query" => handle_kg_query(db, args),
+        "kg_timeline" => handle_kg_timeline(db, args),
+        "kg_stats" => handle_kg_stats(db),
         _ => tool_error(&format!("Unknown tool: {}", name)),
     }
 }
@@ -301,12 +368,13 @@ fn handle_recall(db: &Database, args: &Value) -> Value {
     let working_dir = args.get("working_dir").and_then(|v| v.as_str());
     let hints = args.get("hints").and_then(|v| v.as_str());
     let explain = args.get("explain").and_then(|v| v.as_bool()).unwrap_or(false);
+    let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(false);
     let scope = scope_from_args(args);
     let mode = match RecallMode::from_str(args.get("mode").and_then(|v| v.as_str())) {
         Ok(mode) => mode,
         Err(error) => return tool_error(&error),
     };
-    match db.recall(project, working_dir, hints, mode, explain, &scope) {
+    match db.recall(project, working_dir, hints, mode, explain, compact, &scope) {
         Ok(ctx) => tool_result(&serde_json::to_string_pretty(&ctx).unwrap()),
         Err(e) => tool_error(&e),
     }
@@ -463,15 +531,16 @@ fn handle_project_context(db: &Database, args: &Value) -> Value {
 
 fn handle_get_project_brain(db: &Database, args: &Value) -> Value {
     let proj_detect = args.get("working_dir").and_then(|v| v.as_str()).and_then(|wd| db.detect_project(wd).ok().flatten());
-    
+
     let project = match args.get("project").and_then(|v| v.as_str()).or_else(|| proj_detect.as_deref()) {
         Some(p) => p,
         None => return tool_error("project or working_dir is required, and project must be found"),
     };
-    
+
     let max_tokens = args.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v as usize);
-    
-    match db.get_project_brain(project, max_tokens) {
+    let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    match db.get_project_brain(project, max_tokens, compact) {
         Ok(brain) => tool_result(&serde_json::to_string_pretty(&brain).unwrap()),
         Err(e) => tool_error(&e),
     }
@@ -616,6 +685,72 @@ fn handle_get_file_context(db: &Database, args: &Value) -> Value {
             });
             tool_result(&serde_json::to_string_pretty(&output).unwrap())
         }
+        Err(e) => tool_error(&e),
+    }
+}
+
+// ─── KNOWLEDGE GRAPH TOOLS ───────────────────────────
+
+fn handle_kg_add(db: &Database, args: &Value) -> Value {
+    let subject = match args.get("subject").and_then(|v| v.as_str()) {
+        Some(s) => s, None => return tool_error("subject required"),
+    };
+    let predicate = match args.get("predicate").and_then(|v| v.as_str()) {
+        Some(s) => s, None => return tool_error("predicate required"),
+    };
+    let object = match args.get("object").and_then(|v| v.as_str()) {
+        Some(s) => s, None => return tool_error("object required"),
+    };
+    let valid_from = args.get("valid_from").and_then(|v| v.as_str());
+    let valid_to = args.get("valid_to").and_then(|v| v.as_str());
+    let confidence = args.get("confidence").and_then(|v| v.as_f64());
+    let source_id = args.get("source_memory_id").and_then(|v| v.as_str());
+    match db.add_triple(subject, predicate, object, valid_from, valid_to, confidence, source_id) {
+        Ok(result) => tool_result(&serde_json::to_string_pretty(&result).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_kg_invalidate(db: &Database, args: &Value) -> Value {
+    let subject = match args.get("subject").and_then(|v| v.as_str()) {
+        Some(s) => s, None => return tool_error("subject required"),
+    };
+    let predicate = match args.get("predicate").and_then(|v| v.as_str()) {
+        Some(s) => s, None => return tool_error("predicate required"),
+    };
+    let object = match args.get("object").and_then(|v| v.as_str()) {
+        Some(s) => s, None => return tool_error("object required"),
+    };
+    let ended = args.get("ended").and_then(|v| v.as_str());
+    match db.invalidate_triple(subject, predicate, object, ended) {
+        Ok(result) => tool_result(&serde_json::to_string_pretty(&result).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_kg_query(db: &Database, args: &Value) -> Value {
+    let entity = match args.get("entity").and_then(|v| v.as_str()) {
+        Some(s) => s, None => return tool_error("entity required"),
+    };
+    let as_of = args.get("as_of").and_then(|v| v.as_str());
+    let direction = args.get("direction").and_then(|v| v.as_str()).unwrap_or("both");
+    match db.query_kg_entity(entity, as_of, direction) {
+        Ok(result) => tool_result(&serde_json::to_string_pretty(&result).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_kg_timeline(db: &Database, args: &Value) -> Value {
+    let entity = args.get("entity").and_then(|v| v.as_str());
+    match db.kg_timeline(entity) {
+        Ok(result) => tool_result(&serde_json::to_string_pretty(&result).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_kg_stats(db: &Database) -> Value {
+    match db.kg_stats() {
+        Ok(result) => tool_result(&serde_json::to_string_pretty(&result).unwrap()),
         Err(e) => tool_error(&e),
     }
 }

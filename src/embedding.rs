@@ -1,13 +1,77 @@
-/// MemoryPilot v3.0 — TF-IDF Embedding Engine.
-/// Generates lightweight semantic vectors (384 dims) from text using hashed TF-IDF.
-/// Zero external model, zero API, pure Rust. Enables cosine similarity search + RRF fusion.
+/// MemoryPilot v4.0 — Dual Embedding Engine.
+/// Primary: fastembed transformer (all-MiniLM-L6-v2, 384-dim) when feature enabled.
+/// Fallback: TF-IDF hashing (384-dim) — pure Rust, zero external model.
 use std::collections::HashMap;
 
 const VECTOR_DIM: usize = 384;
 
-/// Generate a TF-IDF-style embedding vector from text.
-/// Uses feature hashing (hashing trick) to map any vocabulary to a fixed 384-dim vector.
-/// This gives ~80% quality of transformer embeddings for keyword-heavy dev content.
+#[cfg(feature = "fastembed")]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(feature = "fastembed")]
+static FASTEMBED_MODEL: OnceLock<Option<Mutex<fastembed::TextEmbedding>>> = OnceLock::new();
+
+#[cfg(feature = "fastembed")]
+fn get_fastembed() -> Option<&'static Mutex<fastembed::TextEmbedding>> {
+    FASTEMBED_MODEL.get_or_init(|| {
+        let opts = fastembed::InitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
+            .with_show_download_progress(false);
+        match fastembed::TextEmbedding::try_new(opts) {
+            Ok(model) => Some(Mutex::new(model)),
+            Err(e) => {
+                eprintln!("[MemoryPilot] fastembed init failed ({}), using TF-IDF fallback", e);
+                None
+            }
+        }
+    }).as_ref()
+}
+
+pub fn embed_text(text: &str) -> Vec<f32> {
+    #[cfg(feature = "fastembed")]
+    {
+        if let Some(mtx) = get_fastembed() {
+            if let Ok(mut model) = mtx.lock() {
+                if let Ok(mut embeddings) = model.embed(vec![text], None) {
+                    if let Some(emb) = embeddings.pop() {
+                        if emb.len() == VECTOR_DIM {
+                            return emb;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tfidf_embed(text)
+}
+
+pub fn embed_batch(texts: &[&str]) -> Vec<Vec<f32>> {
+    #[cfg(feature = "fastembed")]
+    {
+        if let Some(mtx) = get_fastembed() {
+            if let Ok(mut model) = mtx.lock() {
+                if let Ok(embeddings) = model.embed(texts.to_vec(), None) {
+                    if embeddings.len() == texts.len() && embeddings.iter().all(|e| e.len() == VECTOR_DIM) {
+                        return embeddings;
+                    }
+                }
+            }
+        }
+    }
+    texts.iter().map(|t| tfidf_embed(t)).collect()
+}
+
+pub fn is_fastembed_active() -> bool {
+    #[cfg(feature = "fastembed")]
+    {
+        if let Some(mtx) = get_fastembed() {
+            return mtx.lock().is_ok();
+        }
+    }
+    false
+}
+
+// ─── TF-IDF Fallback Engine ──────────────────────────
+
 fn get_synonyms(word: &str) -> Vec<&'static str> {
     match word {
         "login" | "signin" | "authenticate" => vec!["auth", "jwt", "session"],
@@ -24,10 +88,9 @@ fn get_synonyms(word: &str) -> Vec<&'static str> {
     }
 }
 
-pub fn embed_text(text: &str) -> Vec<f32> {
+fn tfidf_embed(text: &str) -> Vec<f32> {
     let mut tokens = tokenize(text);
-    
-    // Inject synonyms (Expert feature)
+
     let mut extra_tokens = Vec::new();
     for t in &tokens {
         for syn in get_synonyms(t) {
@@ -40,27 +103,22 @@ pub fn embed_text(text: &str) -> Vec<f32> {
         return vec![0.0; VECTOR_DIM];
     }
 
-    // Term frequency
     let mut tf: HashMap<&str, f32> = HashMap::new();
     let total = tokens.len() as f32;
     for t in &tokens {
         *tf.entry(t.as_str()).or_default() += 1.0;
     }
 
-    // Build vector using feature hashing
     let mut vec = vec![0.0f32; VECTOR_DIM];
     for (term, count) in &tf {
         let freq = count / total;
-        // IDF approximation: shorter/rarer words get higher weight
         let idf = 1.0 + (1.0 / (term.len() as f32).sqrt());
         let weight = freq * idf;
 
-        // Hash term to multiple positions (reduces collision impact)
         let h1 = hash_term(term, 0) % VECTOR_DIM;
         let h2 = hash_term(term, 1) % VECTOR_DIM;
         let h3 = hash_term(term, 2) % VECTOR_DIM;
 
-        // Sign from hash to spread positive/negative
         let sign1 = if hash_term(term, 3) % 2 == 0 { 1.0 } else { -1.0 };
         let sign2 = if hash_term(term, 4) % 2 == 0 { 1.0 } else { -1.0 };
         let sign3 = if hash_term(term, 5) % 2 == 0 { 1.0 } else { -1.0 };
@@ -70,7 +128,6 @@ pub fn embed_text(text: &str) -> Vec<f32> {
         vec[h3] += weight * sign3 * 0.5;
     }
 
-    // Also hash bigrams for phrase-level semantics
     for pair in tokens.windows(2) {
         let bigram = format!("{}_{}", pair[0], pair[1]);
         let h = hash_term(&bigram, 6) % VECTOR_DIM;
@@ -78,37 +135,31 @@ pub fn embed_text(text: &str) -> Vec<f32> {
         vec[h] += sign * 0.3;
     }
 
-    // L2 normalize
     normalize_vec(&mut vec);
     vec
 }
 
-/// Cosine similarity between two normalized vectors. Range: -1 to 1.
+// ─── Shared Utilities ──────────────────────────────
+
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() { return 0.0; }
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-/// Reciprocal Rank Fusion: combines BM25 and vector search rankings.
-/// k=60 is standard. Returns merged score (higher = better).
 pub fn rrf_score(bm25_rank: usize, vector_rank: usize) -> f64 {
     let k = 60.0;
     (1.0 / (k + bm25_rank as f64)) + (1.0 / (k + vector_rank as f64))
 }
 
-/// Serialize embedding vector to bytes for SQLite BLOB storage.
 pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-/// Deserialize bytes from SQLite BLOB to embedding vector.
 pub fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
     blob.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
-
-// ─── Internal helpers ──────────────────────────────
 
 fn tokenize(text: &str) -> Vec<String> {
     text.to_lowercase()
@@ -125,7 +176,6 @@ fn normalize_vec(v: &mut [f32]) {
     }
 }
 
-/// FNV-1a hash with seed for feature hashing. Fast and well-distributed.
 fn hash_term(term: &str, seed: u64) -> usize {
     let mut h: u64 = 14695981039346656037u64.wrapping_add(seed.wrapping_mul(6364136223846793005));
     for b in term.bytes() {
@@ -141,9 +191,9 @@ mod tests {
 
     #[test]
     fn test_similar_texts() {
-        let v1 = embed_text("authentication login Supabase auth JWT");
-        let v2 = embed_text("user login authentication with JWT tokens");
-        let v3 = embed_text("CSS grid layout flexbox styling");
+        let v1 = tfidf_embed("authentication login Supabase auth JWT");
+        let v2 = tfidf_embed("user login authentication with JWT tokens");
+        let v3 = tfidf_embed("CSS grid layout flexbox styling");
         let sim_related = cosine_similarity(&v1, &v2);
         let sim_unrelated = cosine_similarity(&v1, &v3);
         assert!(sim_related > sim_unrelated, "Related texts should have higher similarity");
@@ -151,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_blob_roundtrip() {
-        let v = embed_text("test embedding roundtrip");
+        let v = tfidf_embed("test embedding roundtrip");
         let blob = vec_to_blob(&v);
         let restored = blob_to_vec(&blob);
         assert_eq!(v.len(), restored.len());
