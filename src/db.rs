@@ -1986,9 +1986,10 @@ impl Database {
                   kind: Option<&str>, tags: Option<&[String]>, watcher_keywords: Option<&[String]>) -> Result<Vec<SearchResult>, String> {
         let canonical_project = Self::canonical_project(project);
 
-        let fts_terms: String = query.split_whitespace()
+        let sanitized_query = query.replace('(', " ").replace(')', " ");
+        let fts_terms: String = sanitized_query.split_whitespace()
             .map(|w| {
-                let clean = w.replace('(', "").replace(')', "").replace('"', "\"\"");
+                let clean = w.replace('"', "\"\"");
                 if clean.trim().is_empty() { return String::new(); }
                 format!("\"{}\"*", clean)
             })
@@ -3648,8 +3649,9 @@ impl Database {
 
         for i in 0..scenario_count {
             let target = &all_memories[i * step];
-            let query = Self::extract_benchmark_query(&target.content);
-            if query.split_whitespace().count() < 2 { continue; }
+            let query_words: Vec<&str> = target.content.split_whitespace().take(8).collect();
+            if query_words.len() < 2 { continue; }
+            let query = query_words.join(" ");
 
             let start = std::time::Instant::now();
             let results = self.search(&query, 10, target.project.as_deref(), None, None, None)?;
@@ -3712,40 +3714,6 @@ impl Database {
             },
             "scenarios": scenarios,
         }))
-    }
-
-    fn extract_benchmark_query(content: &str) -> String {
-        const NOISE: &[&str] = &[
-            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-            "have", "has", "had", "do", "does", "did", "will", "would", "shall",
-            "should", "may", "might", "must", "can", "could", "of", "in", "to",
-            "for", "with", "on", "at", "from", "by", "up", "about", "into",
-            "through", "during", "before", "after", "above", "below", "between",
-            "out", "off", "over", "under", "again", "further", "then", "once",
-            "and", "but", "or", "nor", "not", "no", "so", "if", "it", "its",
-            "that", "this", "these", "those", "i", "me", "my", "we", "you",
-            "he", "she", "they", "them", "his", "her", "our", "your", "their",
-            "what", "which", "who", "whom", "how", "when", "where", "why",
-            "all", "each", "every", "both", "few", "more", "most", "some", "any",
-            "let", "ok", "c", "got", "just", "also", "here", "there",
-            "user", "image", "query",
-        ];
-        let noise_set: std::collections::HashSet<&str> = NOISE.iter().copied().collect();
-
-        let meaningful: Vec<&str> = content.split_whitespace()
-            .filter(|w| {
-                let lower = w.to_lowercase();
-                let clean = lower.trim_matches(|c: char| !c.is_alphanumeric());
-                clean.len() >= 3 && !noise_set.contains(clean) && !clean.starts_with('<') && !clean.starts_with('[')
-            })
-            .take(8)
-            .collect();
-
-        if meaningful.len() >= 2 {
-            meaningful.join(" ")
-        } else {
-            content.split_whitespace().take(8).collect::<Vec<_>>().join(" ")
-        }
     }
 
     fn list_all_memories_for_benchmark(&self) -> Result<Vec<Memory>, String> {

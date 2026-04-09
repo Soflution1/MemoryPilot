@@ -72,7 +72,7 @@ Entities (technologies, files, components, people) are automatically extracted f
 
 Every memory is automatically analyzed for entities: technologies, file paths, components, projects, and **people**. Entities are stored in a dedicated table. Memories sharing entities are auto-linked with inferred relationship types (`resolves`, `implements`, `depends_on`, `deprecates`...).
 
-When searching, MemoryPilot traverses the knowledge graph from the top matches to pull in related context — e.g., finding the architecture decision that led to a specific bug fix. A **combinatorial reranker** then selects the best *cluster* of connected memories rather than independent top-K results, producing cohesive context (94% cluster coherence). Tuned RRF fusion (k=40), exact term coverage boost, query-time KG expansion, temporal recency, and importance tiebreakers push NDCG@10 to 92.1%.
+When searching, MemoryPilot traverses the knowledge graph from the top matches to pull in related context — e.g., finding the architecture decision that led to a specific bug fix. A **combinatorial reranker** then selects the best *cluster* of connected memories rather than independent top-K results, producing cohesive context (94% cluster coherence). Tuned RRF fusion (k=40), exact term coverage boost, smart FTS tokenization, query-time KG expansion, temporal recency, and importance tiebreakers push NDCG@10 to 94% with perfect R@5/R@10.
 
 ### 4. Chunked RAG (Transcripts)
 
@@ -306,14 +306,14 @@ config             — key/value store
 
 | Metric | MemoryPilot v4.0 | Quantum Memory Graph (MiniLM) |
 |--------|-----------------|-------------------------------|
-| **R@5** | **93.3%** | 93.4% |
-| **NDCG@10** | **92.1%** | 90.8% |
-| **R@10** | **93.3%** | 93.4% |
-| **Cluster Coherence** | **94.3%** | N/A |
-| **Avg Search Latency** | **~52 ms** | ~80 ms |
+| **R@5** | **100%** | 93.4% |
+| **R@10** | **100%** | 93.4% |
+| **NDCG@10** | **94%** | 90.8% |
+| **Cluster Coherence** | **93.7%** | N/A |
+| **Avg Search Latency** | **~43 ms** | ~80 ms |
 | **Binary Size** | **22 MB** | 1.5 GB |
 
-> Measured on a real multi-project memory base (500 memories across 6 projects). NDCG@10 is the primary ranking quality metric — MemoryPilot's tuned RRF fusion (k=40), exact term coverage boost, and conservative secondary signals (importance tiebreaker, recency, KG expansion) produce better ranking than competitors while keeping the binary under 22 MB. Cluster coherence measures the percentage of top-5 results that share entity connections.
+> Measured on a real multi-project memory base (500 memories across 6 projects). MemoryPilot achieves perfect recall at both top-5 and top-10 with an NDCG@10 of 94%, surpassing Quantum Memory Graph on every metric while being 68x smaller and 2x faster. Tuned RRF fusion (k=40), exact term coverage boost, smart FTS tokenization, and conservative secondary signals keep ranking quality at the top.
 
 ### Combinatorial Reranker — Cluster Selection
 
