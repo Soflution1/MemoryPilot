@@ -36,7 +36,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 pub fn rrf_score(bm25_rank: usize, vector_rank: usize) -> f64 {
-    let k = 60.0;
+    let k = 40.0;
     (1.0 / (k + bm25_rank as f64)) + (1.0 / (k + vector_rank as f64))
 }
 

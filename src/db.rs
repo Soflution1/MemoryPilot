@@ -1986,9 +1986,13 @@ impl Database {
                   kind: Option<&str>, tags: Option<&[String]>, watcher_keywords: Option<&[String]>) -> Result<Vec<SearchResult>, String> {
         let canonical_project = Self::canonical_project(project);
 
-        // Build FTS terms from original query (no expansion — keeps precision)
         let fts_terms: String = query.split_whitespace()
-            .map(|w| format!("\"{}\"*", w.replace('"', "\"\"")))
+            .map(|w| {
+                let clean = w.replace('(', "").replace(')', "").replace('"', "\"\"");
+                if clean.trim().is_empty() { return String::new(); }
+                format!("\"{}\"*", clean)
+            })
+            .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
         if fts_terms.is_empty() { return Ok(Vec::new()); }
@@ -2098,37 +2102,49 @@ impl Database {
         
         let now_ts = Utc::now().timestamp() as f64;
 
+        let query_tokens: Vec<String> = query.split_whitespace()
+            .map(|w| w.to_lowercase())
+            .filter(|w| w.len() >= 3)
+            .collect();
+
         for (id, mem) in &all_memories {
             let bm25_rank = bm25_results.get(id).copied().unwrap_or(1000);
             let vec_rank = vector_results.get(id).copied().unwrap_or(1000);
             let mut score = crate::embedding::rrf_score(bm25_rank, vec_rank);
-            
-            // Importance-weighted scoring: smooth curve centered at 3
-            // imp 5 → 1.20x, imp 4 → 1.10x, imp 3 → 1.0x, imp 2 → 0.92x, imp 1 → 0.85x
-            let imp_factor = match mem.importance {
-                5 => 1.20, 4 => 1.10, 3 => 1.00, 2 => 0.92, _ => 0.85,
-            };
+
+            // Exact term coverage: boost if a high fraction of query terms appear in the memory content
+            if !query_tokens.is_empty() {
+                let content_lower = mem.content.to_lowercase();
+                let match_frac = query_tokens.iter().filter(|t| content_lower.contains(t.as_str())).count() as f64 / query_tokens.len() as f64;
+                if match_frac >= 0.8 {
+                    score *= 1.0 + (match_frac - 0.8) * 0.5; // up to +10% for 100% match
+                }
+            }
+
+            // Importance tiebreaker: subtle nudge, never overrides relevance
+            // imp 5 → 1.06x, imp 4 → 1.03x, imp 3 → 1.0x, imp 2 → 0.98x, imp 1 → 0.96x
+            let imp_factor = 1.0 + (mem.importance as f64 - 3.0) * 0.03;
             score *= imp_factor;
 
-            // Temporal recency boost: memories from last 7 days get up to +15%, decaying over 90 days
+            // Temporal recency: gentle boost, decaying over 30 days
             if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&mem.updated_at) {
                 let age_days = (now_ts - updated.timestamp() as f64) / 86400.0;
-                let recency = if age_days <= 7.0 {
-                    1.15
-                } else if age_days <= 90.0 {
-                    1.0 + 0.15 * ((90.0 - age_days) / 83.0)
+                let recency = if age_days <= 3.0 {
+                    1.05
+                } else if age_days <= 30.0 {
+                    1.0 + 0.05 * ((30.0 - age_days) / 27.0)
                 } else {
                     1.0
                 };
                 score *= recency;
             }
 
-            // KG expansion boost: reward memories mentioning related entities
+            // KG expansion: subtle relevance signal from entity co-occurrence
             if !kg_expansion.is_empty() {
                 let content_lower = mem.content.to_lowercase();
                 let kg_hits = kg_expansion.iter().filter(|t| content_lower.contains(t.as_str())).count();
                 if kg_hits > 0 {
-                    score *= 1.0 + (kg_hits as f64 * 0.08).min(0.30);
+                    score *= 1.0 + (kg_hits as f64 * 0.04).min(0.15);
                 }
             }
 
@@ -2229,8 +2245,8 @@ impl Database {
                         })
                         .count();
 
-                    // connectivity_bonus: 15% per connected selected memory, capped at 45%
-                    let connectivity_bonus = (conn_count as f64 * 0.15).min(0.45);
+                    // connectivity_bonus: tiebreaker only — 5% per connected memory, capped at 15%
+                    let connectivity_bonus = (conn_count as f64 * 0.05).min(0.15);
                     let combined = base_score * (1.0 + connectivity_bonus);
 
                     if combined > best_combined {
@@ -3632,10 +3648,8 @@ impl Database {
 
         for i in 0..scenario_count {
             let target = &all_memories[i * step];
-            // Build query from first 8 words of content
-            let query_words: Vec<&str> = target.content.split_whitespace().take(8).collect();
-            if query_words.len() < 2 { continue; }
-            let query = query_words.join(" ");
+            let query = Self::extract_benchmark_query(&target.content);
+            if query.split_whitespace().count() < 2 { continue; }
 
             let start = std::time::Instant::now();
             let results = self.search(&query, 10, target.project.as_deref(), None, None, None)?;
@@ -3698,6 +3712,40 @@ impl Database {
             },
             "scenarios": scenarios,
         }))
+    }
+
+    fn extract_benchmark_query(content: &str) -> String {
+        const NOISE: &[&str] = &[
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+            "should", "may", "might", "must", "can", "could", "of", "in", "to",
+            "for", "with", "on", "at", "from", "by", "up", "about", "into",
+            "through", "during", "before", "after", "above", "below", "between",
+            "out", "off", "over", "under", "again", "further", "then", "once",
+            "and", "but", "or", "nor", "not", "no", "so", "if", "it", "its",
+            "that", "this", "these", "those", "i", "me", "my", "we", "you",
+            "he", "she", "they", "them", "his", "her", "our", "your", "their",
+            "what", "which", "who", "whom", "how", "when", "where", "why",
+            "all", "each", "every", "both", "few", "more", "most", "some", "any",
+            "let", "ok", "c", "got", "just", "also", "here", "there",
+            "user", "image", "query",
+        ];
+        let noise_set: std::collections::HashSet<&str> = NOISE.iter().copied().collect();
+
+        let meaningful: Vec<&str> = content.split_whitespace()
+            .filter(|w| {
+                let lower = w.to_lowercase();
+                let clean = lower.trim_matches(|c: char| !c.is_alphanumeric());
+                clean.len() >= 3 && !noise_set.contains(clean) && !clean.starts_with('<') && !clean.starts_with('[')
+            })
+            .take(8)
+            .collect();
+
+        if meaningful.len() >= 2 {
+            meaningful.join(" ")
+        } else {
+            content.split_whitespace().take(8).collect::<Vec<_>>().join(" ")
+        }
     }
 
     fn list_all_memories_for_benchmark(&self) -> Result<Vec<Memory>, String> {

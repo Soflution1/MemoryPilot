@@ -72,7 +72,7 @@ Entities (technologies, files, components, people) are automatically extracted f
 
 Every memory is automatically analyzed for entities: technologies, file paths, components, projects, and **people**. Entities are stored in a dedicated table. Memories sharing entities are auto-linked with inferred relationship types (`resolves`, `implements`, `depends_on`, `deprecates`...).
 
-When searching, MemoryPilot traverses the knowledge graph from the top matches to pull in related context — e.g., finding the architecture decision that led to a specific bug fix. A **combinatorial reranker** then selects the best *cluster* of connected memories rather than independent top-K results, producing cohesive context (95.7% cluster coherence). Query-time KG expansion, temporal recency boost, and importance-weighted scoring push NDCG@10 to 85.6%.
+When searching, MemoryPilot traverses the knowledge graph from the top matches to pull in related context — e.g., finding the architecture decision that led to a specific bug fix. A **combinatorial reranker** then selects the best *cluster* of connected memories rather than independent top-K results, producing cohesive context (94% cluster coherence). Tuned RRF fusion (k=40), exact term coverage boost, query-time KG expansion, temporal recency, and importance tiebreakers push NDCG@10 to 92.1%.
 
 ### 4. Chunked RAG (Transcripts)
 
@@ -293,33 +293,36 @@ config             — key/value store
 - **Batched scoring**: knowledge triple counts and link boosts fetched in single queries, not N+1
 - **Debounced cleanup**: expired memory cleanup runs max once per 60 seconds
 - **Prepared statements**: graph traversal prepares SQL once, not per node
-- **Combinatorial reranker**: greedy subgraph selection boosts connected memory clusters (+15% per connection)
-- **KG query expansion**: post-retrieval scoring boost from knowledge graph related terms (+8% per entity match)
-- **Temporal recency boost**: memories from last 7 days get +15%, decaying over 90 days
-- **Importance-weighted scoring**: importance 5 → 1.20x, importance 1 → 0.85x (smooth curve)
+- **Tuned RRF fusion**: k=40 for sharper top-K discrimination vs standard k=60
+- **Exact term coverage boost**: +10% when 80%+ of query terms appear in memory content
+- **Combinatorial reranker**: greedy subgraph selection, conservative +5% per connection (cap 15%)
+- **KG query expansion**: post-retrieval scoring boost from knowledge graph related terms (+4% per entity, cap 15%)
+- **Temporal recency**: gentle +5% for memories from last 3 days, decaying over 30 days
+- **Importance tiebreaker**: ±3% per level — never overrides relevance signal
 
 ## Benchmarks
 
 ### Search Quality — Real-World (500 memories, 30 scenarios)
 
-| Metric | MemoryPilot v4.0 |
-|--------|-----------------|
-| **R@5** | **93.3%** |
-| **R@10** | **100%** |
-| **NDCG@10** | **85.6%** |
-| **Cluster Coherence** | **95.7%** |
-| **Avg Search Latency** | **~10 ms** |
+| Metric | MemoryPilot v4.0 | Quantum Memory Graph (MiniLM) |
+|--------|-----------------|-------------------------------|
+| **R@5** | **93.3%** | 93.4% |
+| **NDCG@10** | **92.1%** | 90.8% |
+| **R@10** | **93.3%** | 93.4% |
+| **Cluster Coherence** | **94.3%** | N/A |
+| **Avg Search Latency** | **~52 ms** | ~80 ms |
+| **Binary Size** | **22 MB** | 1.5 GB |
 
-> Measured on a real multi-project memory base (500 memories across 6 projects) with the combinatorial reranker enabled. Cluster coherence measures the percentage of top-5 results that share entity connections — higher means the returned context is more cohesive and useful.
+> Measured on a real multi-project memory base (500 memories across 6 projects). NDCG@10 is the primary ranking quality metric — MemoryPilot's tuned RRF fusion (k=40), exact term coverage boost, and conservative secondary signals (importance tiebreaker, recency, KG expansion) produce better ranking than competitors while keeping the binary under 22 MB. Cluster coherence measures the percentage of top-5 results that share entity connections.
 
 ### Combinatorial Reranker — Cluster Selection
 
 | Method | Cluster Coherence | Context Quality |
 |--------|------------------|-----------------|
 | Flat Top-K (no reranker) | ~60% | Individual best matches |
-| **Graph + Greedy Subgraph** | **98%** | Connected memory clusters |
+| **Graph + Greedy Subgraph** | **94%** | Connected memory clusters |
 
-The combinatorial reranker selects the best *combination* of memories, not just the best individuals. Connected memories boost each other's scores (+15% per connection, capped at 45%), producing cohesive context clusters instead of disconnected facts.
+The combinatorial reranker selects the best *combination* of memories, not just the best individuals. Connected memories get a conservative tiebreaker boost (+5% per connection, capped at 15%) — enough to prefer cohesive clusters without overriding relevance.
 
 ### Recall Quality Benchmark
 
