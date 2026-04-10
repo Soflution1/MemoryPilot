@@ -1,6 +1,9 @@
 <p align="center">
   <br/>
-  <img src="static/logo.png?v=2" alt="MemoryPilot" width="520"/>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/static/logo.png"/>
+    <img src="https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/static/logo.png" alt="MemoryPilot" width="520"/>
+  </picture>
   <br/><br/>
 </p>
 
