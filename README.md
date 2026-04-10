@@ -22,6 +22,26 @@
 
 AI coding assistants forget everything between sessions. MemoryPilot gives them persistent, searchable memory with project awareness, semantic understanding, and automatic knowledge organization. Built-in AAAK compression reduces token consumption by 3x when loading context, saving you money on every API call.
 
+## Benchmarks
+
+### Search Quality — Real-World (500 memories, 30 scenarios)
+
+| Metric | MemoryPilot v4.0 | MemPalace v3.1 (raw) | Quantum Memory Graph |
+|--------|-----------------|----------------------|---------------------|
+| **R@5** | **100%** | 96.6%¹ | 93.4% |
+| **R@10** | **100%** | N/A | 93.4% |
+| **NDCG@10** | **95.6%** | 88.9%¹ | 90.8% |
+| **Cluster Coherence** | **96.7%** | N/A | N/A |
+| **Multilingual** | **100+ languages** | English only | English only |
+| **AAAK Compression** | 3x (no recall loss) | 30x (recall drops to 84.2%) | N/A |
+| **Avg Search Latency** | **~69 ms** | N/A | ~80 ms |
+| **Binary Size** | **22 MB** | ~500 MB (Python+ChromaDB) | 1.5 GB |
+| **Dependencies** | 0 (single binary) | Python + ChromaDB + SQLite | Python + ONNX |
+
+> ¹ MemPalace's 96.6% R@5 is measured on LongMemEval-s (~50 sessions per haystack, session-level retrieval). Their AAAK compression mode drops recall to 84.2%. Their benchmark tests raw ChromaDB retrieval — none of the Palace architecture (wings, rooms, closets) is exercised in the benchmark ([source](https://github.com/milla-jovovich/mempalace/issues/214)). MemoryPilot's scores are measured on a real multi-project memory base (500 memories across 6 projects) with all features active (GraphRAG, KG expansion, combinatorial reranker, importance scoring).
+
+---
+
 **vs the best MCP memory servers:**
 
 | Feature | MemoryPilot v4.0 | MemPalace v3.1 | Mem0 |
@@ -303,52 +323,12 @@ config             — key/value store
 - **Temporal recency**: gentle +5% for memories from last 3 days, decaying over 30 days
 - **Importance tiebreaker**: ±3% per level — never overrides relevance signal
 
-## Benchmarks
-
-### Search Quality — Real-World (500 memories, 30 scenarios)
-
-| Metric | MemoryPilot v4.0 | MemPalace v3.1 (raw) | Quantum Memory Graph |
-|--------|-----------------|----------------------|---------------------|
-| **R@5** | **100%** | 96.6%¹ | 93.4% |
-| **R@10** | **100%** | N/A | 93.4% |
-| **NDCG@10** | **95.6%** | 88.9%¹ | 90.8% |
-| **Cluster Coherence** | **96.7%** | N/A | N/A |
-| **Multilingual** | **100+ languages** | English only | English only |
-| **AAAK Compression** | 3x (no recall loss) | 30x (recall drops to 84.2%) | N/A |
-| **Avg Search Latency** | **~69 ms** | N/A | ~80 ms |
-| **Binary Size** | **22 MB** | ~500 MB (Python+ChromaDB) | 1.5 GB |
-| **Dependencies** | 0 (single binary) | Python + ChromaDB + SQLite | Python + ONNX |
-
-> ¹ MemPalace's 96.6% R@5 is measured on LongMemEval-s (~50 sessions per haystack, session-level retrieval). Their AAAK compression mode drops recall to 84.2%. Their benchmark tests raw ChromaDB retrieval — none of the Palace architecture (wings, rooms, closets) is exercised in the benchmark ([source](https://github.com/milla-jovovich/mempalace/issues/214)). MemoryPilot's scores are measured on a real multi-project memory base (500 memories across 6 projects) with all features active (GraphRAG, KG expansion, combinatorial reranker, importance scoring).
-
-### Combinatorial Reranker — Cluster Selection
-
-| Method | Cluster Coherence | Context Quality |
-|--------|------------------|-----------------|
-| Flat Top-K (no reranker) | ~60% | Individual best matches |
-| **Graph + Greedy Subgraph** | **94%** | Connected memory clusters |
-
-The combinatorial reranker selects the best *combination* of memories, not just the best individuals. Connected memories get a conservative tiebreaker boost (+5% per connection, capped at 15%) — enough to prefer cohesive clusters without overriding relevance.
-
-### Recall Quality Benchmark
+## Run Benchmarks Yourself
 
 ```bash
-MemoryPilot --benchmark-recall --scenario-limit 12
+MemoryPilot --benchmark-search --scenario-limit 30    # R@5, R@10, NDCG@10, cluster coherence, latency
+MemoryPilot --benchmark-recall --scenario-limit 12    # top1/top5 hit rate, cross-project leak, credential safety
 ```
-
-Runs against your real memory base using `recall(explain=true)`.
-
-- Fixed **golden** scenarios for stable, repeatable quality checks
-- Generated fallback scenarios from the current memory base
-- Metrics: `top1_hit_rate`, `top5_hit_rate`, `cross_project_leak_rate`, `credential_leak_rate_safe`
-
-### Search Quality Benchmark
-
-```bash
-MemoryPilot --benchmark-search --scenario-limit 30
-```
-
-Runs hybrid search against your real memories and reports R@5, R@10, NDCG@10, cluster coherence, and latency.
 
 ## Storage
 
