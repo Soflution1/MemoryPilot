@@ -70,12 +70,12 @@ else
     if [ -f "$SCRIPT_DIR/Cargo.toml" ]; then
         info "Building MemoryPilot (release)..."
         cd "$SCRIPT_DIR"
-        cargo build --release --quiet
+        cargo build --release --features http --quiet
         mkdir -p "$INSTALL_DIR"
         cp "target/release/$BINARY_NAME" "$BINARY_PATH"
     elif [ -f "./Cargo.toml" ]; then
-        info "Building MemoryPilot (release)..."
-        cargo build --release --quiet
+        info "Building MemoryPilot (release + HTTP)..."
+        cargo build --release --features http --quiet
         mkdir -p "$INSTALL_DIR"
         cp "target/release/$BINARY_NAME" "$BINARY_PATH"
     else
@@ -189,3 +189,6 @@ fi
 
 printf "\n  Restart your IDE(s) to activate MemoryPilot.\n"
 printf "  All configured IDEs share the same memory.\n\n"
+printf "  ${BOLD}For ChatGPT Desktop:${NC}\n"
+printf "    Run: MemoryPilot --http 7437\n"
+printf "    Then add http://localhost:7437/mcp as a custom connector.\n\n"

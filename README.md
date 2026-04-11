@@ -147,21 +147,32 @@ The installer builds MemoryPilot, installs the binary to `~/.local/bin/`, detect
 
 | IDE | Config file | Auto-configured |
 |-----|------------|-----------------|
-| **Cursor** | `~/.cursor/mcp.json` | ✓ |
-| **VS Code** | `~/.vscode/mcp.json` | ✓ |
-| **Claude Desktop** | `~/Library/Application Support/Claude/claude_desktop_config.json` | ✓ (macOS) |
-| **Windsurf** | `~/.codeium/windsurf/mcp_config.json` | ✓ |
+| **Cursor** | `~/.cursor/mcp.json` | ✓ (stdio) |
+| **VS Code** | `~/.vscode/mcp.json` | ✓ (stdio) |
+| **Claude Desktop** | `~/Library/Application Support/Claude/claude_desktop_config.json` | ✓ (stdio) |
+| **Windsurf** | `~/.codeium/windsurf/mcp_config.json` | ✓ (stdio) |
 | **Claude Code** | `claude mcp add` | ✓ (CLI) |
 | **Codex** | `codex mcp add` | ✓ (CLI) |
+| **ChatGPT Desktop** | Settings → Apps → Create | via HTTP (see below) |
 
 The script is idempotent — run it again to update without breaking existing MCP configs.
+
+### ChatGPT Desktop
+
+ChatGPT requires a remote MCP endpoint. Start the HTTP server, then add it as a custom connector:
+
+```bash
+MemoryPilot --http 7437
+```
+
+In ChatGPT: Settings → Apps → Create → URL: `http://localhost:7437/mcp`
 
 ### Manual install
 
 ```bash
 git clone https://github.com/Soflution1/MemoryPilot.git
 cd MemoryPilot
-cargo build --release
+cargo build --release --features http
 cp target/release/MemoryPilot ~/.local/bin/
 chmod +x ~/.local/bin/MemoryPilot
 xattr -cr ~/.local/bin/MemoryPilot  # macOS only
@@ -169,15 +180,11 @@ xattr -cr ~/.local/bin/MemoryPilot  # macOS only
 
 Then add MemoryPilot to your IDE's MCP config manually (see table above for file paths).
 
-### With HTTP server
-
-```bash
-cargo build --release --features http
-```
-
 ### How it works
 
 **That's it.** MemoryPilot automatically injects a dynamic System Prompt into your IDE on startup. The AI will proactively call `add_memory` in the background to store your architecture decisions, API keys, and bug fixes without manual intervention. All configured IDEs share the same memory database.
+
+For ChatGPT or any MCP client that needs HTTP: run `MemoryPilot --http` to expose the Streamable HTTP endpoint at `/mcp`.
 
 Or use via [McpHub](https://github.com/Soflution1/McpHub) for SSE transport with all your other MCP servers.
 
