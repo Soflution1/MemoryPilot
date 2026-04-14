@@ -32,7 +32,7 @@ AI coding assistants forget everything between sessions. MemoryPilot gives them 
 ### LongMemEval-S (ICLR 2025) — Academic Standard
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/static/benchmark_chart.svg" alt="MemoryPilot vs MemPalace — LongMemEval-S Benchmark" width="680"/>
+  <img src="https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/static/benchmark_chart.png" alt="MemoryPilot vs MemPalace - LongMemEval-S Benchmark" width="680"/>
 </p>
 
 Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.10813) benchmark (ICLR 2025), the standard academic dataset for long-term memory retrieval. Turn-level granularity, ~50 sessions per haystack, all features active.
