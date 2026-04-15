@@ -2396,7 +2396,7 @@ impl Database {
         let mut preview_candidates: Vec<crate::gc::GcPreviewCandidate> = Vec::new();
         
         for kind in &config.compressible_kinds {
-            let sql = "SELECT id, content, project, importance, updated_at FROM memories WHERE kind = ?1";
+            let sql = "SELECT id, content, project, importance, updated_at FROM memories WHERE kind = ?1 AND tags NOT LIKE '%pinned%'";
             if let Ok(mut stmt) = self.conn.prepare(&sql) {
                 if let Ok(rows) = stmt.query_map(params![kind], |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, i32>(3)?, r.get::<_, String>(4)?))
@@ -2552,6 +2552,261 @@ impl Database {
         }
 
         Ok((capsules_created, memories_compressed))
+    }
+
+    // ─── FIND RELATED ─────────────────────────────────
+
+    pub fn find_related(&self, id: &str, depth: u32) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        let related_ids = crate::graph::traverse_graph(&self.conn, &[id.to_string()], depth)?;
+        let mut results: Vec<serde_json::Value> = Vec::new();
+        for rid in &related_ids {
+            if rid == id { continue; }
+            if let Ok(Some(mem)) = self.get_memory(rid) {
+                results.push(json!({
+                    "id": mem.id,
+                    "kind": mem.kind,
+                    "project": mem.project,
+                    "importance": mem.importance,
+                    "preview": if mem.content.len() > 150 { format!("{}...", &mem.content[..150]) } else { mem.content.clone() },
+                    "tags": mem.tags,
+                }));
+            }
+        }
+        Ok(json!({
+            "source_id": id,
+            "depth": depth,
+            "related_count": results.len(),
+            "related": results,
+        }))
+    }
+
+    // ─── BULK DELETE ──────────────────────────────────
+
+    pub fn bulk_delete(&self, kind: Option<&str>, project: Option<&str>,
+                       tag: Option<&str>, older_than_days: Option<i64>,
+                       importance_max: Option<i32>) -> Result<usize, String> {
+        let canonical_project = Self::canonical_project(project);
+        let mut conditions: Vec<String> = Vec::new();
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(k) = kind {
+            conditions.push(format!("kind = ?{}", param_values.len() + 1));
+            param_values.push(Box::new(k.to_string()));
+        }
+        if let Some(p) = canonical_project.as_deref() {
+            conditions.push(format!("project = ?{}", param_values.len() + 1));
+            param_values.push(Box::new(p.to_string()));
+        }
+        if let Some(imp) = importance_max {
+            conditions.push(format!("importance <= ?{}", param_values.len() + 1));
+            param_values.push(Box::new(imp));
+        }
+        if let Some(days) = older_than_days {
+            let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+            conditions.push(format!("updated_at < ?{}", param_values.len() + 1));
+            param_values.push(Box::new(cutoff));
+        }
+
+        // Never bulk-delete pinned memories
+        conditions.push("tags NOT LIKE '%pinned%'".to_string());
+
+        if conditions.is_empty() {
+            return Err("At least one filter required".to_string());
+        }
+
+        // First collect IDs to delete (for cascading entity/link cleanup)
+        let select_sql = format!("SELECT id FROM memories WHERE {}", conditions.join(" AND "));
+        let mut stmt = self.conn.prepare(&select_sql).map_err(|e| format!("Bulk select: {}", e))?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+        let ids: Vec<String> = stmt.query_map(params_ref.as_slice(), |r| r.get::<_, String>(0))
+            .map_err(|e| format!("Bulk query: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Filter by tag if specified (needs JSON parsing)
+        let ids_to_delete: Vec<String> = if let Some(tag_filter) = tag {
+            ids.into_iter().filter(|id| {
+                self.get_memory(id).ok().flatten()
+                    .map(|m| m.tags.iter().any(|t| t == tag_filter))
+                    .unwrap_or(false)
+            }).collect()
+        } else {
+            ids
+        };
+
+        let mut deleted = 0;
+        for id in &ids_to_delete {
+            if self.delete_memory(id).unwrap_or(false) {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
+
+    // ─── MEMORY HEALTH REPORT ────────────────────────
+
+    pub fn memory_health_report(&self) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        let now = chrono::Utc::now();
+
+        let total: i64 = self.conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0)).unwrap_or(0);
+
+        // By kind
+        let mut by_kind: Vec<(String, i64)> = Vec::new();
+        if let Ok(mut stmt) = self.conn.prepare("SELECT kind, COUNT(*) FROM memories GROUP BY kind ORDER BY COUNT(*) DESC") {
+            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+                by_kind = rows.filter_map(|r| r.ok()).collect();
+            }
+        }
+
+        // By project
+        let mut by_project: Vec<(String, i64)> = Vec::new();
+        if let Ok(mut stmt) = self.conn.prepare("SELECT COALESCE(project, '(global)'), COUNT(*) FROM memories GROUP BY project ORDER BY COUNT(*) DESC") {
+            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+                by_project = rows.filter_map(|r| r.ok()).collect();
+            }
+        }
+
+        // By importance
+        let mut by_importance: Vec<(i32, i64)> = Vec::new();
+        if let Ok(mut stmt) = self.conn.prepare("SELECT importance, COUNT(*) FROM memories GROUP BY importance ORDER BY importance DESC") {
+            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, i64>(1)?))) {
+                by_importance = rows.filter_map(|r| r.ok()).collect();
+            }
+        }
+
+        // Pinned count
+        let pinned: i64 = self.conn.query_row("SELECT COUNT(*) FROM memories WHERE tags LIKE '%pinned%'", [], |r| r.get(0)).unwrap_or(0);
+
+        // Stale memories (> 30 days, importance <= 2)
+        let cutoff_30 = (now - chrono::Duration::days(30)).to_rfc3339();
+        let stale: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE updated_at < ?1 AND importance <= 2",
+            params![cutoff_30], |r| r.get(0),
+        ).unwrap_or(0);
+
+        // Compression potential (compressible old memories)
+        let compressible: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE updated_at < ?1 AND importance <= 3 AND kind NOT IN ('credential', 'architecture', 'transcript_chunk') AND tags NOT LIKE '%pinned%'",
+            params![cutoff_30], |r| r.get(0),
+        ).unwrap_or(0);
+
+        // Average age in days
+        let avg_age: f64 = self.conn.query_row(
+            "SELECT AVG(julianday('now') - julianday(created_at)) FROM memories", [], |r| r.get(0),
+        ).unwrap_or(0.0);
+
+        // Orphan entities and links
+        let orphan_entities: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_entities WHERE memory_id NOT IN (SELECT id FROM memories)", [], |r| r.get(0),
+        ).unwrap_or(0);
+        let orphan_links: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_links WHERE source_id NOT IN (SELECT id FROM memories) OR target_id NOT IN (SELECT id FROM memories)", [], |r| r.get(0),
+        ).unwrap_or(0);
+
+        // DB size
+        let db_path = dirs::home_dir().unwrap_or_default().join(DB_DIR).join(DB_FILE);
+        let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+        // Capsule count
+        let capsules: i64 = self.conn.query_row("SELECT COUNT(*) FROM memories WHERE tags LIKE '%capsule%'", [], |r| r.get(0)).unwrap_or(0);
+
+        Ok(json!({
+            "total_memories": total,
+            "pinned": pinned,
+            "capsules": capsules,
+            "stale_low_value": stale,
+            "compression_potential": compressible,
+            "orphan_entities": orphan_entities,
+            "orphan_links": orphan_links,
+            "avg_age_days": (avg_age * 10.0).round() / 10.0,
+            "db_size_bytes": db_size,
+            "db_size_mb": (db_size as f64 / 1_048_576.0 * 100.0).round() / 100.0,
+            "by_kind": by_kind.into_iter().map(|(k, c)| json!({"kind": k, "count": c})).collect::<Vec<_>>(),
+            "by_project": by_project.into_iter().map(|(p, c)| json!({"project": p, "count": c})).collect::<Vec<_>>(),
+            "by_importance": by_importance.into_iter().map(|(i, c)| json!({"importance": i, "count": c})).collect::<Vec<_>>(),
+        }))
+    }
+
+    // ─── DEDUPE REPORT ───────────────────────────────
+
+    pub fn dedupe_report(&self, project: Option<&str>, threshold: f64) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        let canonical_project = Self::canonical_project(project);
+        let memories: Vec<(String, String, String, i32)> = if let Some(proj) = canonical_project.as_deref() {
+            let mut stmt = self.conn.prepare("SELECT id, content, kind, importance FROM memories WHERE project = ?1 ORDER BY created_at DESC LIMIT 500")
+                .map_err(|e| format!("Dedupe prepare: {}", e))?;
+            let result: Vec<(String, String, String, i32)> = stmt.query_map(params![proj], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i32>(3)?)))
+                .map_err(|e| format!("Dedupe query: {}", e))?.filter_map(|r| r.ok()).collect();
+            result
+        } else {
+            let mut stmt = self.conn.prepare("SELECT id, content, kind, importance FROM memories ORDER BY created_at DESC LIMIT 500")
+                .map_err(|e| format!("Dedupe prepare: {}", e))?;
+            let result: Vec<(String, String, String, i32)> = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i32>(3)?)))
+                .map_err(|e| format!("Dedupe query: {}", e))?.filter_map(|r| r.ok()).collect();
+            result
+        };
+
+        let mut groups: Vec<serde_json::Value> = Vec::new();
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        for i in 0..memories.len() {
+            if seen.contains(&i) { continue; }
+            let mut group: Vec<serde_json::Value> = Vec::new();
+            let words_i: std::collections::HashSet<String> = memories[i].1.split_whitespace()
+                .map(|w: &str| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+                .filter(|w: &String| w.len() > 2)
+                .collect();
+            if words_i.is_empty() { continue; }
+
+            for j in (i + 1)..memories.len() {
+                if seen.contains(&j) { continue; }
+                let words_j: std::collections::HashSet<String> = memories[j].1.split_whitespace()
+                    .map(|w: &str| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+                    .filter(|w: &String| w.len() > 2)
+                    .collect();
+                if words_j.is_empty() { continue; }
+
+                let intersection = words_i.intersection(&words_j).count();
+                let union = words_i.union(&words_j).count();
+                let jaccard = if union > 0 { intersection as f64 / union as f64 } else { 0.0 };
+
+                if jaccard >= threshold {
+                    if group.is_empty() {
+                        group.push(json!({
+                            "id": memories[i].0,
+                            "kind": memories[i].2,
+                            "importance": memories[i].3,
+                            "preview": if memories[i].1.len() > 120 { format!("{}...", &memories[i].1[..120]) } else { memories[i].1.clone() },
+                        }));
+                    }
+                    group.push(json!({
+                        "id": memories[j].0,
+                        "kind": memories[j].2,
+                        "importance": memories[j].3,
+                        "similarity": (jaccard * 100.0).round() / 100.0,
+                        "preview": if memories[j].1.len() > 120 { format!("{}...", &memories[j].1[..120]) } else { memories[j].1.clone() },
+                    }));
+                    seen.insert(j);
+                }
+            }
+
+            if !group.is_empty() {
+                seen.insert(i);
+                groups.push(json!({
+                    "group_size": group.len(),
+                    "memories": group,
+                }));
+            }
+        }
+
+        Ok(json!({
+            "threshold": threshold,
+            "duplicate_groups": groups.len(),
+            "total_duplicates": groups.iter().map(|g| g["group_size"].as_u64().unwrap_or(0)).sum::<u64>(),
+            "groups": groups,
+        }))
     }
 
     // ─── EXPORT ───────────────────────────────────────
@@ -3120,6 +3375,21 @@ impl Database {
                 .collect()
         };
 
+        // 1b. Pinned memories — always included regardless of score/hints
+        let pinned_memories: Vec<Memory> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count \
+                 FROM memories WHERE tags LIKE '%pinned%' ORDER BY importance DESC, updated_at DESC"
+            ).map_err(|e| format!("Recall pinned: {}", e))?;
+            let result: Vec<Memory> = stmt.query_map([], |r| Ok(row_to_memory(r)))
+                .map_err(|e| format!("Recall pinned: {}", e))?
+                .flatten()
+                .filter(|m| Self::should_include_in_context(m, mode))
+                .filter(|m| budget_check!(&m.id, &m.content))
+                .collect();
+            result
+        };
+
         // 2. Hint-based search (most relevant to current task)
         let hint_results: Vec<SearchResult> = if let Some(h) = hints {
             if !h.trim().is_empty() {
@@ -3258,6 +3528,10 @@ impl Database {
                 "content": m.content, "kind": m.kind, "project": m.project,
                 "importance": m.importance
             })).collect::<Vec<_>>(),
+            "pinned_memories": pinned_memories.iter().map(|m| serde_json::json!({
+                "id": m.id, "content": m.content, "kind": m.kind, "project": m.project,
+                "importance": m.importance
+            })).collect::<Vec<_>>(),
             "scope_context": scope_memories.iter().map(|m| serde_json::json!({
                 "content": m.content, "kind": m.kind, "importance": m.importance
             })).collect::<Vec<_>>(),
@@ -3282,6 +3556,7 @@ impl Database {
                         "credentials_hidden_in_safe_mode": credentials_hidden,
                         "category_counts": {
                             "critical": critical.len(),
+                            "pinned": pinned_memories.len(),
                             "hint": hint_results.len(),
                             "scope": scope_memories.len(),
                             "project": project_context_memories_count,

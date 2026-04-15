@@ -87,6 +87,11 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 | Auto-Classification | Zero-shot kind/importance/TTL on insert | No | No |
 | Auto-Compaction | GC triggers automatically at 500+ memories | No | No |
 | Memory Capsules | Compress old memories into dense summaries | No | No |
+| Memory Pinning | Pin critical memories — always in recall, GC-proof | No | No |
+| Graph Traversal | Find related memories via KG (depth 1-3) | No | No |
+| Bulk Operations | Delete by kind/project/tag/age with safety guards | No | No |
+| Health Dashboard | Memory distribution, stale count, orphans, DB size | No | No |
+| Dedup Detection | Jaccard similarity scan for near-duplicates | No | No |
 | Person detection | Auto-detects team members from text | No | No |
 | Self-Healing | Background auto-linting loop | No | No |
 | Garbage collection | Heuristic merge + scoring + orphan cleanup | No | Basic TTL |
@@ -95,7 +100,7 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 | Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Embedding similarity |
 | HTTP API | Multi-threaded REST server (optional) | No | Cloud hosted |
 | Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | 1 type |
-| MCP tools | 30 tools | 19 tools | N/A |
+| MCP tools | 36 tools | 19 tools | N/A |
 | Privacy | 100% local, zero API calls | 100% local | Cloud dependent |
 | Language | Rust (single binary, zero deps) | Python (pip install) | SaaS |
 | Startup | 1-2 ms | ~5 ms | N/A (cloud) |
@@ -300,6 +305,12 @@ MemoryPilot --backfill-force
 | `run_gc` | Garbage collection: merge old memories, clean orphans, vacuum. Supports `dry_run`. |
 | `compact_memories` | Compress old low-importance memories into dense capsules (~100-200 tokens). Credentials/architecture never compressed. |
 | `cleanup_expired` | Remove expired TTL memories (debounced — runs max once per 60s). |
+| `pin_memory` | Pin a critical memory — always included in recall, never garbage collected. |
+| `unpin_memory` | Unpin a previously pinned memory, making it eligible for GC again. |
+| `find_related` | Find all memories related to a given ID via Knowledge Graph traversal (depth 1-3). |
+| `bulk_delete` | Delete memories by kind, project, tag, age, or importance. Never touches pinned memories. |
+| `get_memory_health` | Health report: distribution by kind/project/importance, stale count, orphans, compression potential, DB size. |
+| `dedupe_report` | Find potential duplicates via Jaccard similarity for manual review. |
 | `benchmark_recall` | Recall quality benchmark with golden scenarios. |
 | `benchmark_search` | Search quality benchmark: R@5, R@10, NDCG@10, cluster coherence, latency. |
 | `migrate_v1` | Import from v1 JSON files. |
@@ -344,7 +355,7 @@ curl -X POST http://localhost:7437/tools/call \
 ```
 src/main.rs        — CLI + MCP stdio server + file watcher init + HTTP server init
 src/db.rs          — SQLite engine: hybrid search, CRUD, KG, GC, brain, recall, lazy embed, connection pool
-src/tools.rs       — 30 MCP tool definitions + handlers
+src/tools.rs       — 36 MCP tool definitions + handlers
 src/protocol.rs    — JSON-RPC types
 src/embedding.rs   — fastembed (multilingual-e5-small) transformer embeddings, LRU cache
 src/graph.rs       — Entity extraction (tech, files, components, people) + relation inference + graph traversal

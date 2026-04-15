@@ -338,6 +338,58 @@ pub fn tool_definitions() -> Value {
             "name": "kg_stats",
             "description": "Knowledge graph overview: entity count, triple count, current vs expired facts, relationship types.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "pin_memory",
+            "description": "Pin a memory so it is always included in recall and never garbage collected. Use for critical context.",
+            "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] }
+        },
+        {
+            "name": "unpin_memory",
+            "description": "Unpin a previously pinned memory, making it eligible for GC again.",
+            "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] }
+        },
+        {
+            "name": "find_related",
+            "description": "Find all memories related to a given memory via Knowledge Graph traversal (shared entities, linked facts).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Memory ID to find relations for" },
+                    "depth": { "type": "integer", "default": 2, "description": "Graph traversal depth (1-3)" }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "bulk_delete",
+            "description": "Delete multiple memories matching filters. At least one filter required. Returns count of deleted memories.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "description": "Delete all memories of this kind" },
+                    "project": { "type": "string", "description": "Delete all memories for this project" },
+                    "tag": { "type": "string", "description": "Delete all memories containing this tag" },
+                    "older_than_days": { "type": "integer", "description": "Delete memories older than N days" },
+                    "importance_max": { "type": "integer", "description": "Only delete memories with importance <= this value" }
+                }
+            }
+        },
+        {
+            "name": "get_memory_health",
+            "description": "Comprehensive health report: memory distribution by kind/project/importance, stale count, orphan entities, compression potential, avg age, pinned count.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "dedupe_report",
+            "description": "Find potential duplicate or near-duplicate memories for review. Returns groups of similar memories with similarity scores.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Limit to a specific project" },
+                    "threshold": { "type": "number", "default": 0.7, "description": "Jaccard similarity threshold (0.0-1.0)" }
+                }
+            }
         }
     ]})
 }
@@ -374,6 +426,12 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "kg_query" => handle_kg_query(db, args),
         "kg_timeline" => handle_kg_timeline(db, args),
         "kg_stats" => handle_kg_stats(db),
+        "pin_memory" => handle_pin(db, args, true),
+        "unpin_memory" => handle_pin(db, args, false),
+        "find_related" => handle_find_related(db, args),
+        "bulk_delete" => handle_bulk_delete(db, args),
+        "get_memory_health" => handle_memory_health(db),
+        "dedupe_report" => handle_dedupe_report(db, args),
         _ => tool_error(&format!("Unknown tool: {}", name)),
     }
 }
@@ -822,6 +880,83 @@ fn handle_kg_timeline(db: &Database, args: &Value) -> Value {
 fn handle_kg_stats(db: &Database) -> Value {
     match db.kg_stats() {
         Ok(result) => tool_result(&serde_json::to_string_pretty(&result).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+// ─── Pin/Unpin ────────────────────────────────────
+
+fn handle_pin(db: &Database, args: &Value, pin: bool) -> Value {
+    let id = match args.get("id").and_then(|v| v.as_str()) {
+        Some(s) => s, None => return tool_error("id required"),
+    };
+    match db.get_memory(id) {
+        Ok(Some(mem)) => {
+            let mut tags = mem.tags.clone();
+            if pin {
+                if !tags.contains(&"pinned".to_string()) { tags.push("pinned".to_string()); }
+            } else {
+                tags.retain(|t| t != "pinned");
+            }
+            let new_imp = if pin { Some(mem.importance.max(4)) } else { None };
+            match db.update_memory_full(id, None, None, Some(&tags), new_imp, None, None) {
+                Ok(_) => tool_result(&format!("Memory {} {}", id, if pin { "pinned (protected from GC, always in recall)" } else { "unpinned" })),
+                Err(e) => tool_error(&e),
+            }
+        }
+        Ok(None) => tool_error(&format!("Memory {} not found", id)),
+        Err(e) => tool_error(&e),
+    }
+}
+
+// ─── Find Related ─────────────────────────────────
+
+fn handle_find_related(db: &Database, args: &Value) -> Value {
+    let id = match args.get("id").and_then(|v| v.as_str()) {
+        Some(s) => s, None => return tool_error("id required"),
+    };
+    let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(2).min(3) as u32;
+    match db.find_related(id, depth) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+// ─── Bulk Delete ──────────────────────────────────
+
+fn handle_bulk_delete(db: &Database, args: &Value) -> Value {
+    let kind = args.get("kind").and_then(|v| v.as_str());
+    let project = args.get("project").and_then(|v| v.as_str());
+    let tag = args.get("tag").and_then(|v| v.as_str());
+    let older_than_days = args.get("older_than_days").and_then(|v| v.as_i64());
+    let importance_max = args.get("importance_max").and_then(|v| v.as_i64()).map(|v| v as i32);
+
+    if kind.is_none() && project.is_none() && tag.is_none() && older_than_days.is_none() {
+        return tool_error("At least one filter required (kind, project, tag, or older_than_days)");
+    }
+
+    match db.bulk_delete(kind, project, tag, older_than_days, importance_max) {
+        Ok(count) => tool_result(&format!("Deleted {} memories", count)),
+        Err(e) => tool_error(&e),
+    }
+}
+
+// ─── Memory Health ────────────────────────────────
+
+fn handle_memory_health(db: &Database) -> Value {
+    match db.memory_health_report() {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+// ─── Dedupe Report ────────────────────────────────
+
+fn handle_dedupe_report(db: &Database, args: &Value) -> Value {
+    let project = args.get("project").and_then(|v| v.as_str());
+    let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.7);
+    match db.dedupe_report(project, threshold) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
         Err(e) => tool_error(&e),
     }
 }
