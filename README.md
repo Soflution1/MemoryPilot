@@ -9,7 +9,7 @@
 
 <p align="center">
   <strong>The most advanced MCP memory server. Period.</strong><br><br>
-  <sub>Hybrid search (BM25 + multilingual-e5-small RRF) · 100+ languages · Temporal Knowledge Graph · AAAK compression (3x token savings) · GraphRAG · Chunked RAG · Auto-Linting · Project brain · HTTP API · Single binary · Zero API calls</sub>
+  <sub>Hybrid search (BM25 + multilingual-e5-small RRF) · 100+ languages · Temporal Knowledge Graph · AAAK compression (5-10x token savings) · GraphRAG · Chunked RAG · Auto-Compaction · Auto-Classification · Memory Capsules · Project brain · HTTP API · Single binary · Zero API calls</sub>
 </p>
 
 <p align="center">
@@ -17,7 +17,7 @@
   <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust"/>
   <img src="https://img.shields.io/badge/search-Hybrid_RRF-blueviolet" alt="Hybrid RRF"/>
   <img src="https://img.shields.io/badge/embeddings-multilingual--e5--small_(384--dim)-blue" alt="multilingual-e5-small"/>
-  <img src="https://img.shields.io/badge/tokens-3x_compression-brightgreen" alt="3x token savings"/>
+  <img src="https://img.shields.io/badge/tokens-5--10x_compression-brightgreen" alt="5-10x token savings"/>
   <img src="https://img.shields.io/badge/license-Source_Available-orange" alt="Source Available"/>
 </p>
 
@@ -25,7 +25,7 @@
 
 ## Why
 
-AI coding assistants forget everything between sessions. MemoryPilot gives them persistent, searchable memory with project awareness, semantic understanding, and automatic knowledge organization. Built-in AAAK compression reduces token consumption by 3x when loading context, saving you money on every API call.
+AI coding assistants forget everything between sessions. MemoryPilot gives them persistent, searchable memory with project awareness, semantic understanding, and automatic knowledge organization. Built-in AAAK compression and memory capsules reduce token consumption by 5-10x when loading context. Every memory is auto-classified with the right importance, kind, and TTL on insert. The database compacts itself automatically — zero maintenance.
 
 ## Benchmarks
 
@@ -66,7 +66,7 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 | **NDCG@10** | **95.6%** | 88.9% | 90.8% |
 | **Cluster Coherence** | **96.7%** | N/A | N/A |
 | **Multilingual** | **100+ languages** | English only | English only |
-| **AAAK Compression** | 3x (no recall loss) | 30x (recall drops to 84.2%) | N/A |
+| **AAAK Compression** | **5-10x** (no recall loss) | 30x (recall drops to 84.2%) | N/A |
 | **Avg Search Latency** | **~14 ms** | N/A | ~80 ms |
 | **Binary Size** | **22 MB** | ~500 MB (Python+ChromaDB) | 1.5 GB |
 | **Dependencies** | 0 (single binary) | Python + ChromaDB + SQLite | Python + ONNX |
@@ -83,7 +83,10 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 | Knowledge Graph | Temporal triples with validity + confidence | Temporal triples (SQLite) | Basic graph (no temporal) |
 | GraphRAG | Auto entity extraction + graph traversal + combinatorial reranker | No | No |
 | Chunked RAG | Transcript auto-chunking + auto-distillation (8 types) | Conversation chunking by exchange | No |
-| Compression | AAAK compact dialect (~3x token savings) | AAAK dialect (experimental, regresses recall to 84.2%) | No |
+| Compression | AAAK + Memory Capsules (5-10x token savings) | AAAK dialect (experimental, regresses recall to 84.2%) | No |
+| Auto-Classification | Zero-shot kind/importance/TTL on insert | No | No |
+| Auto-Compaction | GC triggers automatically at 500+ memories | No | No |
+| Memory Capsules | Compress old memories into dense summaries | No | No |
 | Person detection | Auto-detects team members from text | No | No |
 | Self-Healing | Background auto-linting loop | No | No |
 | Garbage collection | Heuristic merge + scoring + orphan cleanup | No | Basic TTL |
@@ -100,7 +103,7 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 | Storage | SQLite WAL + FTS5 + connection pool | ChromaDB | Cloud DB |
 | Concurrency | Lazy embedding thread + read pool + debounced cleanup | Single-threaded | Single-threaded |
 
-## The 8 Pillars
+## The 9 Pillars
 
 ### 1. Hybrid Search (BM25 + fastembed RRF)
 
@@ -159,7 +162,7 @@ Old, low-importance memories are scored for cleanup candidacy. Groups of related
 
 **Memory Capsules** (`compact_memories` tool): compress old low-importance memories into dense ~100-200 token capsules. Credentials and architecture decisions are never compressed. Capsules preserve Knowledge Graph links, giving you 5-10x token savings on aged memories without recall loss.
 
-### 7b. Zero-Shot Auto-Classification
+### 8. Zero-Shot Auto-Classification
 
 Every memory is automatically classified on insert when the caller doesn't specify kind or importance. Pattern-based heuristics detect:
 
@@ -173,7 +176,7 @@ Every memory is automatically classified on insert when the caller doesn't speci
 
 No LLM needed — pure regex + keyword heuristics. The AI can still override by passing explicit `kind` and `importance`.
 
-### 8. Project Brain
+### 9. Project Brain
 
 One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech stack, architecture decisions, active bugs, recent changes, key components, and **team members** (auto-detected person entities). Supports `compact: true` for AAAK compression.
 
@@ -260,7 +263,7 @@ MemoryPilot --backfill-force
 
 | Tool | Description |
 |------|-------------|
-| `add_memory` | Store with lazy embedding, auto-dedup (hash exact + Jaccard 85%), auto entity extraction, auto graph linking. Importance 1-5, TTL. |
+| `add_memory` | Store with lazy embedding, auto-dedup (hash exact + Jaccard 85%), auto entity extraction, auto graph linking, **auto-classification** (kind, importance, TTL inferred from content). |
 | `add_memories` | Bulk add multiple memories in one call with per-item dedup. |
 | `add_transcript` | Store a long transcript as chunked archive, auto-distill structured memories (`decision`, `preference`, `todo`, `bug`, `milestone`, `problem`, `note`). |
 | `get_memory` | Retrieve by ID. |
@@ -341,7 +344,7 @@ curl -X POST http://localhost:7437/tools/call \
 ```
 src/main.rs        — CLI + MCP stdio server + file watcher init + HTTP server init
 src/db.rs          — SQLite engine: hybrid search, CRUD, KG, GC, brain, recall, lazy embed, connection pool
-src/tools.rs       — 29 MCP tool definitions + handlers
+src/tools.rs       — 30 MCP tool definitions + handlers
 src/protocol.rs    — JSON-RPC types
 src/embedding.rs   — fastembed (multilingual-e5-small) transformer embeddings, LRU cache
 src/graph.rs       — Entity extraction (tech, files, components, people) + relation inference + graph traversal
@@ -393,6 +396,9 @@ config             — key/value store
 - **KG query expansion**: post-retrieval scoring boost from knowledge graph related terms (+4% per entity, cap 15%)
 - **Temporal recency**: gentle +5% for memories from last 3 days, decaying over 30 days
 - **Importance tiebreaker**: ±3% per level — never overrides relevance signal
+- **Auto-compaction**: GC triggers automatically when memory count > 500, debounced to once per 5 minutes
+- **Memory capsules**: old low-importance memories compressed into ~100-200 token summaries (5-10x savings)
+- **Zero-shot auto-classification**: pattern-based heuristics assign kind, importance, and TTL on insert without LLM
 
 ## Run Benchmarks Yourself
 
