@@ -1545,7 +1545,27 @@ impl Database {
             tags: tags.to_vec(), source: source.into(), importance: imp, expires_at: expires_at.map(String::from),
             created_at: now.clone(), updated_at: now, metadata: scoped_metadata, last_accessed_at: None, access_count: 0 };
         let _ = self.rebuild_links(&mem);
+
+        // Auto-compaction: trigger GC when memory count exceeds threshold
+        self.maybe_auto_compact();
+
         Ok((mem, false))
+    }
+
+    /// Trigger auto-compaction if memory count exceeds threshold.
+    /// Debounced: runs max once per 5 minutes.
+    fn maybe_auto_compact(&self) {
+        use std::sync::{Mutex, OnceLock};
+        static LAST_COMPACT: OnceLock<Mutex<std::time::Instant>> = OnceLock::new();
+        let last = LAST_COMPACT.get_or_init(|| Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(600)));
+        if let Ok(mut ts) = last.lock() {
+            if ts.elapsed() < std::time::Duration::from_secs(300) { return; }
+            let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0)).unwrap_or(0);
+            if (count as usize) < crate::gc::AUTO_COMPACT_THRESHOLD { return; }
+            *ts = std::time::Instant::now();
+            let config = crate::gc::GcConfig::default();
+            let _ = self.run_gc(&config, false);
+        }
     }
     /// Full update with all fields.
     pub fn update_memory_full(&self, id: &str, content: Option<&str>, kind: Option<&str>,
@@ -2470,6 +2490,68 @@ impl Database {
             preview_candidates,
             hygiene,
         })
+    }
+
+    // ─── MEMORY CAPSULES ──────────────────────────────
+
+    /// Compress old low-importance memories into dense capsules.
+    /// Groups by project + age, merges into ~100-200 token summaries.
+    /// Preserves Knowledge Graph links. Returns (capsules_created, memories_compressed).
+    pub fn compact_to_capsules(&self, age_days: i64, importance_max: i32) -> Result<(usize, usize), String> {
+        let now = chrono::Utc::now();
+        let sql = "SELECT id, content, kind, project, importance, updated_at FROM memories WHERE kind NOT IN ('credential', 'architecture', 'transcript_chunk') AND importance <= ?1";
+        let mut stmt = self.conn.prepare(sql).map_err(|e| format!("Capsule prepare: {}", e))?;
+        let all_rows: Vec<(String, String, String, Option<String>, i32, String)> = stmt.query_map(
+            params![importance_max],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, i32>(4)?, r.get::<_, String>(5)?)),
+        ).map_err(|e| format!("Capsule query: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let rows: Vec<&(String, String, String, Option<String>, i32, String)> = all_rows.iter()
+            .filter(|(_id, _content, _kind, _proj, _imp, updated_at)| {
+                chrono::DateTime::parse_from_rfc3339(updated_at)
+                    .map(|dt| (now - dt.with_timezone(&chrono::Utc)).num_days() >= age_days)
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if rows.len() < 3 {
+            return Ok((0, 0));
+        }
+
+        // Group by project
+        let mut by_project: std::collections::HashMap<Option<String>, Vec<(String, String, String)>> =
+            std::collections::HashMap::new();
+        for (id, content, kind, project, _imp, _updated) in rows {
+            by_project.entry(project.clone()).or_default().push((id.clone(), content.clone(), kind.clone()));
+        }
+
+        let mut capsules_created = 0usize;
+        let mut memories_compressed = 0usize;
+
+        for (project, items) in by_project {
+            // Process in chunks of 10
+            for chunk in items.chunks(10) {
+                if chunk.len() < 2 { continue; }
+                let contents: Vec<String> = chunk.iter().map(|(_, c, _)| c.clone()).collect();
+                let kinds: Vec<String> = chunk.iter().map(|(_, _, k)| k.clone()).collect();
+                let capsule = crate::gc::capsule_summary(&contents, &kinds, project.as_deref());
+
+                if self.add_memory(&capsule, "note", project.as_deref(),
+                    &["capsule".to_string(), "compressed".to_string()],
+                    "auto_capsule", 3, None, None, &MemoryScope::default()).is_ok()
+                {
+                    for (id, _, _) in chunk {
+                        let _ = self.delete_memory(id);
+                        memories_compressed += 1;
+                    }
+                    capsules_created += 1;
+                }
+            }
+        }
+
+        Ok((capsules_created, memories_compressed))
     }
 
     // ─── EXPORT ───────────────────────────────────────

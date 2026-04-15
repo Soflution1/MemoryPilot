@@ -191,7 +191,7 @@ fn print_help() {
     println!("  MemoryPilot --version        Show version");
     println!("  MemoryPilot --help           Show this help");
     println!();
-    println!("MCP TOOLS (29):");
+    println!("MCP TOOLS (30):");
     println!("  recall              Load all context in one shot (start here)");
     println!("  get_project_brain   Instant project summary (<1500 tokens)");
     println!("  search_memory       Hybrid BM25 + fastembed RRF search");

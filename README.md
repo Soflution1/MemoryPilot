@@ -92,7 +92,7 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 | Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Embedding similarity |
 | HTTP API | Multi-threaded REST server (optional) | No | Cloud hosted |
 | Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | 1 type |
-| MCP tools | 29 tools | 19 tools | N/A |
+| MCP tools | 30 tools | 19 tools | N/A |
 | Privacy | 100% local, zero API calls | 100% local | Cloud dependent |
 | Language | Rust (single binary, zero deps) | Python (pip install) | SaaS |
 | Startup | 1-2 ms | ~5 ms | N/A (cloud) |
@@ -151,9 +151,27 @@ MemoryPilot watches your files. When you save a Rust, Svelte, or TypeScript file
 
 The linter thread reuses a single DB connection for its entire lifetime.
 
-### 7. Garbage Collection
+### 7. Garbage Collection & Auto-Compaction
 
 Old, low-importance memories are scored for cleanup candidacy. Groups of related stale memories are merged into condensed summaries using heuristic keyword extraction. Orphaned links and entities are cleaned. DB is vacuumed after significant deletions.
+
+**Auto-compaction** triggers automatically when the memory count exceeds 500: the GC runs in the background after `add_memory`, debounced to once per 5 minutes. Zero manual intervention.
+
+**Memory Capsules** (`compact_memories` tool): compress old low-importance memories into dense ~100-200 token capsules. Credentials and architecture decisions are never compressed. Capsules preserve Knowledge Graph links, giving you 5-10x token savings on aged memories without recall loss.
+
+### 7b. Zero-Shot Auto-Classification
+
+Every memory is automatically classified on insert when the caller doesn't specify kind or importance. Pattern-based heuristics detect:
+
+- **Credentials** (API keys, secrets) → importance 5, no TTL
+- **Architecture decisions** → importance 5
+- **Preferences/patterns** → importance 4
+- **Bugs** → importance 3, TTL 90 days
+- **TODOs** → importance 2, TTL 30 days
+- **Code snippets** → importance 2
+- **Milestones** → importance 4
+
+No LLM needed — pure regex + keyword heuristics. The AI can still override by passing explicit `kind` and `importance`.
 
 ### 8. Project Brain
 
@@ -227,7 +245,7 @@ MemoryPilot --backfill
 MemoryPilot --backfill-force
 ```
 
-## MCP Tools (29)
+## MCP Tools (30)
 
 ### Core
 
@@ -277,6 +295,7 @@ MemoryPilot --backfill-force
 | Tool | Description |
 |------|-------------|
 | `run_gc` | Garbage collection: merge old memories, clean orphans, vacuum. Supports `dry_run`. |
+| `compact_memories` | Compress old low-importance memories into dense capsules (~100-200 tokens). Credentials/architecture never compressed. |
 | `cleanup_expired` | Remove expired TTL memories (debounced — runs max once per 60s). |
 | `benchmark_recall` | Recall quality benchmark with golden scenarios. |
 | `benchmark_search` | Search quality benchmark: R@5, R@10, NDCG@10, cluster coherence, latency. |

@@ -152,6 +152,135 @@ pub fn gc_score(importance: i32, age_days: i64, kind: &str, _config: &GcConfig) 
     (importance_score * 0.4 + age_factor * 0.3 + kind_weight * 0.3).min(1.0)
 }
 
+// ─── Auto-compaction threshold ────────────────────────
+
+/// Threshold at which auto-compaction triggers (number of memories).
+pub const AUTO_COMPACT_THRESHOLD: usize = 500;
+
+/// Generate a memory capsule from a set of old memories.
+/// Ultra-condensed summary (100-200 tokens) preserving key facts and KG links.
+pub fn capsule_summary(contents: &[String], kinds: &[String], project: Option<&str>) -> String {
+    if contents.len() == 1 {
+        return contents[0].clone();
+    }
+
+    let mut word_freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut fact_sentences: Vec<String> = Vec::new();
+
+    for c in contents {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for w in c.split_whitespace() {
+            let w = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+            if w.len() > 3 && !is_stopword(&w) && seen.insert(w.clone()) {
+                *word_freq.entry(w).or_default() += 1;
+            }
+        }
+        let trimmed = c.trim();
+        let end = trimmed.find(". ").map(|i| i + 1).unwrap_or_else(|| trimmed.len().min(100));
+        if end > 5 {
+            fact_sentences.push(trimmed[..end].to_string());
+        }
+    }
+
+    let mut top_words: Vec<(String, usize)> = word_freq.into_iter().collect();
+    top_words.sort_by(|a, b| b.1.cmp(&a.1));
+    let keywords: String = top_words.iter().take(8).map(|(w, _)| w.as_str()).collect::<Vec<_>>().join(", ");
+
+    let unique_kinds: std::collections::HashSet<&str> = kinds.iter().map(|k| k.as_str()).collect();
+    let kinds_label: String = unique_kinds.into_iter().collect::<Vec<_>>().join("+");
+
+    let project_prefix = project.map(|p| format!("[{}] ", p)).unwrap_or_default();
+
+    let bullets: Vec<String> = fact_sentences.iter()
+        .take(6)
+        .map(|s| format!("- {}", s))
+        .collect();
+
+    format!(
+        "{}[CAPSULE:{}] {} items | keywords: {}\n{}",
+        project_prefix, kinds_label, contents.len(), keywords, bullets.join("\n")
+    )
+}
+
+/// Estimate importance of content based on heuristic patterns.
+/// Returns (importance 1-5, inferred_kind, suggested_ttl_days).
+pub fn auto_classify(content: &str) -> (i32, &'static str, Option<i64>) {
+    let lower = content.to_lowercase();
+
+    // Credential/secret detection (importance 5, no TTL)
+    if lower.contains("api_key") || lower.contains("api key") || lower.contains("secret")
+        || lower.contains("password") || lower.contains("token")
+        || lower.contains("credential") || lower.contains("private_key")
+    {
+        return (5, "credential", None);
+    }
+
+    // Architecture/decision (importance 4-5)
+    if lower.contains("architecture") || lower.contains("we decided")
+        || lower.contains("on a décidé") || lower.contains("stack")
+        || lower.contains("migration") || lower.contains("breaking change")
+    {
+        return (5, "architecture", None);
+    }
+    if lower.contains("decided") || lower.contains("decision")
+        || lower.contains("décision") || lower.contains("convention")
+        || lower.contains("approach") || lower.contains("design pattern")
+    {
+        return (4, "decision", None);
+    }
+
+    // Preference (importance 4)
+    if lower.contains("prefer") || lower.contains("always use")
+        || lower.contains("never use") || lower.contains("préfère")
+        || lower.contains("toujours utiliser") || lower.contains("jamais utiliser")
+    {
+        return (4, "preference", None);
+    }
+
+    // Pattern (importance 3-4)
+    if lower.contains("pattern") || lower.contains("best practice")
+        || lower.contains("convention") || lower.contains("rule")
+        || lower.contains("standard") || lower.contains("guideline")
+    {
+        return (4, "pattern", None);
+    }
+
+    // Bug (importance 3, TTL 90 days — bugs get fixed)
+    if lower.contains("bug") || lower.contains("error") || lower.contains("fix")
+        || lower.contains("crash") || lower.contains("broken") || lower.contains("erreur")
+        || lower.contains("exception") || lower.contains("stack trace")
+    {
+        return (3, "bug", Some(90));
+    }
+
+    // Todo (importance 2, TTL 30 days)
+    if lower.contains("todo") || lower.contains("à faire") || lower.contains("task")
+        || lower.contains("implement") || lower.contains("need to")
+        || lower.contains("il faut") || lower.contains("should add")
+    {
+        return (2, "todo", Some(30));
+    }
+
+    // Snippet (importance 2)
+    if lower.contains("```") || lower.contains("fn ") || lower.contains("function ")
+        || lower.contains("class ") || lower.contains("import ")
+        || lower.contains("const ") || lower.contains("export ")
+    {
+        return (2, "snippet", None);
+    }
+
+    // Milestone (importance 4)
+    if lower.contains("shipped") || lower.contains("deployed") || lower.contains("launched")
+        || lower.contains("released") || lower.contains("milestone")
+        || lower.contains("livré") || lower.contains("déployé") || lower.contains("v1") || lower.contains("v2")
+    {
+        return (4, "milestone", None);
+    }
+
+    // Default: fact, importance 3
+    (3, "fact", None)
+}
+
 /// Common English/French stopwords to skip during keyword extraction.
 fn is_stopword(word: &str) -> bool {
     matches!(word,

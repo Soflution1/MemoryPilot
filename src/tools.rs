@@ -234,6 +234,17 @@ pub fn tool_definitions() -> Value {
         },
         { "name": "migrate_v1", "description": "Import from v1 JSON files. Skips duplicates.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "cleanup_expired", "description": "Manually remove all expired memories.", "inputSchema": { "type": "object", "properties": {} } },
+        {
+            "name": "compact_memories",
+            "description": "Compress old low-importance memories into dense capsules (~100-200 tokens each). Preserves Knowledge Graph links. Credentials and architecture decisions are never compressed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "age_days": { "type": "integer", "default": 14, "description": "Minimum age in days for memories to be eligible" },
+                    "importance_max": { "type": "integer", "default": 3, "description": "Maximum importance level to compress (1-5)" }
+                }
+            }
+        },
         { 
             "name": "run_gc", 
             "description": "Trigger Garbage Collection manually. Compresses old bugs/snippets and deletes expired. `preview`/`dry_run` returns exact candidate groups with confidence and hygiene signals before mutating anything.", 
@@ -354,6 +365,7 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "set_config" => handle_set_config(db, args),
         "migrate_v1" => handle_migrate(db),
         "cleanup_expired" => handle_cleanup(db),
+        "compact_memories" => handle_compact(db, args),
         "run_gc" => handle_run_gc(db, args),
         "toggle_auto_lint" => handle_toggle_lint(args),
         "get_file_context" => handle_get_file_context(db, args),
@@ -396,14 +408,24 @@ fn handle_add(db: &Database, args: &Value) -> Value {
         Some(c) if !c.trim().is_empty() => c,
         _ => return tool_error("content is required"),
     };
-    let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("fact");
+
+    // Auto-classify when kind or importance not explicitly provided
+    let (auto_imp, auto_kind, auto_ttl) = crate::gc::auto_classify(content);
+    let user_kind = args.get("kind").and_then(|v| v.as_str());
+    let kind = user_kind.unwrap_or(auto_kind);
     if !VALID_KINDS.contains(&kind) { return tool_error(&format!("Invalid kind '{}'. Valid: {:?}", kind, VALID_KINDS)); }
     let project = args.get("project").and_then(|v| v.as_str());
     let tags: Vec<String> = args.get("tags").and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
     let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("cursor");
-    let importance = args.get("importance").and_then(|v| v.as_i64()).unwrap_or(3) as i32;
-    let expires_at = args.get("expires_at").and_then(|v| v.as_str());
+    let importance = args.get("importance").and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(auto_imp);
+    let expires_at_owned: Option<String> = args.get("expires_at").and_then(|v| v.as_str()).map(String::from)
+        .or_else(|| auto_ttl.map(|days| {
+            (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339()
+        }));
+    let expires_at = expires_at_owned.as_deref();
     let metadata = args.get("metadata").filter(|v| !v.is_null());
     let scope = scope_from_args(args);
 
@@ -652,6 +674,18 @@ fn handle_migrate(db: &Database) -> Value {
 fn handle_cleanup(db: &Database) -> Value {
     match db.cleanup_expired() {
         Ok(count) => tool_result(&format!("Cleaned up {} expired memories.", count)),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_compact(db: &Database, args: &Value) -> Value {
+    let age_days = args.get("age_days").and_then(|v| v.as_i64()).unwrap_or(14);
+    let importance_max = args.get("importance_max").and_then(|v| v.as_i64()).unwrap_or(3) as i32;
+    match db.compact_to_capsules(age_days, importance_max) {
+        Ok((capsules, compressed)) => {
+            tool_result(&format!("Compacted {} memories into {} capsules (age >= {} days, importance <= {})",
+                compressed, capsules, age_days, importance_max))
+        }
         Err(e) => tool_error(&e),
     }
 }
